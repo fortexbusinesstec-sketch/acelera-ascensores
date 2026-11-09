@@ -1,0 +1,397 @@
+/* eslint-disable jsx-a11y/alt-text -- @react-pdf/renderer Image does not support HTML alt attributes */
+import React from "react";
+import fs from "node:fs";
+import path from "node:path";
+import {
+  Document,
+  Page,
+  Text,
+  View,
+  StyleSheet,
+  Image,
+  Font,
+} from "@react-pdf/renderer";
+import { resolveClauseText } from "../clause-defaults";
+
+const FONT_DIR = path.join(process.cwd(), "public", "fonts");
+const ARIAL_PATH = path.join(FONT_DIR, "arial.ttf");
+const ARIAL_BD_PATH = path.join(FONT_DIR, "arialbd.ttf");
+
+if (fs.existsSync(ARIAL_PATH) && fs.existsSync(ARIAL_BD_PATH)) {
+  Font.register({
+    family: "Arial",
+    fonts: [
+      { src: ARIAL_PATH },
+      { src: ARIAL_BD_PATH, fontWeight: 700 },
+    ],
+  });
+}
+
+export interface ContractPdfElevator {
+  brand: string;
+  internalCode: string;
+  type: string;
+  model: string;
+  capacityKg: number | null;
+  capacityPersons: number | null;
+  speedMs: number | null;
+  stops: number | null;
+  floors: number | null;
+}
+
+export interface ContractTemplateData {
+  costCenterName: string;
+  costCenterAddress: string;
+  costCenterDistrict: string;
+  clientSignerName: string;
+  clientSignerDocument: string;
+  elevatorsCount: number;
+  elevators: ContractPdfElevator[];
+  elevatorsBrand: string;
+  elevatorsInternalCode: string;
+  elevatorsFeatures: string;
+  baseAmount: string;
+  baseAmountText: string;
+  currency: string;
+  includesIgvText: string;
+  paymentTermDays: number;
+  currentDay: string;
+  currentMonth: string;
+  currentYear: string;
+  contractDurationYears: number;
+  aceleraFooterUrl: string;
+  aceleraLogoUrl: string;
+  aceleraSignatureUrl: string;
+  customClauses?: Record<string, string>;
+}
+
+const styles = StyleSheet.create({
+  page: {
+    paddingTop: 140,
+    paddingBottom: 80,
+    paddingHorizontal: 60,
+    fontFamily: "Arial",
+    fontSize: 10,
+    lineHeight: 1.5,
+    color: "#050505",
+  },
+  header: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    width: "100%",
+    height: 10,
+    flexDirection: "row",
+  },
+  franjaRed: {
+    backgroundColor: "#810303",
+    width: "50%",
+  },
+  franjaBlack: {
+    backgroundColor: "#000000",
+    width: "50%",
+  },
+  logo: {
+    position: "absolute",
+    top: 30,
+    right: 60,
+    width: 140,
+  },
+  pageNumber: {
+    position: "absolute",
+    bottom: 30,
+    left: 0,
+    right: 0,
+    textAlign: "center",
+    fontSize: 9,
+    color: "#666666",
+  },
+  footerGraphic: {
+    position: "absolute",
+    bottom: 0,
+    left: 0,
+    right: 0,
+    width: "100%",
+    height: 70,
+  },
+  title: {
+    fontSize: 14,
+    fontWeight: "bold",
+    textAlign: "center",
+    marginBottom: 20,
+    color: "#000000",
+  },
+  paragraph: {
+    marginBottom: 10,
+    textAlign: "justify",
+  },
+  bold: {
+    fontWeight: "bold",
+  },
+  list: {
+    marginLeft: 20,
+    marginBottom: 10,
+  },
+  equipmentBlock: {
+    marginBottom: 8,
+  },
+  equipmentTitle: {
+    fontWeight: "bold",
+    marginBottom: 3,
+  },
+  equipmentColumns: {
+    flexDirection: "row",
+  },
+  equipmentColumn: {
+    width: "50%",
+    paddingRight: 12,
+  },
+  equipmentRow: {
+    fontSize: 9.5,
+    marginBottom: 2,
+  },
+  equipmentLabel: {
+    fontWeight: "bold",
+  },
+  signaturesContainer: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginTop: 60,
+  },
+  signatureBlock: {
+    width: 200,
+    alignItems: "center",
+  },
+  signatureImage: {
+    width: 150,
+    height: 60,
+    objectFit: "contain",
+    marginBottom: 5,
+  },
+  signatureLine: {
+    width: "100%",
+    borderTopWidth: 1,
+    borderTopColor: "#000",
+    marginTop: 10,
+    paddingTop: 5,
+    textAlign: "center",
+  },
+});
+
+function clause(
+  customClauses: Record<string, string> | undefined,
+  key: string,
+  data: ContractTemplateData
+): string {
+  return resolveClauseText(customClauses, key, data);
+}
+
+export const PreventiveContractPDF: React.FC<ContractTemplateData> = (
+  data
+) => {
+  const cc = data.customClauses;
+
+  return (
+    <Document>
+      <Page size="A4" style={styles.page}>
+        {/* Header repeated on every page: franja 50% roja + 50% negra */}
+        <View style={styles.header} fixed wrap={false}>
+          <View style={styles.franjaRed} />
+          <View style={styles.franjaBlack} />
+        </View>
+
+        {/* Logo letterhead on every page */}
+        {data.aceleraLogoUrl && (
+          <Image src={data.aceleraLogoUrl} style={styles.logo} fixed />
+        )}
+
+        {/* Footer repeated on every page */}
+        {data.aceleraFooterUrl && (
+          <Image src={data.aceleraFooterUrl} style={styles.footerGraphic} fixed />
+        )}
+
+        {/* Dynamic page numbering below the safe zone's bottom edge */}
+        <Text
+          style={styles.pageNumber}
+          fixed
+          render={({ pageNumber, totalPages }) =>
+            `Página ${pageNumber} de ${totalPages}`
+          }
+        />
+
+        {/* Contract content (flows inside the page's safe padding) */}
+        <Text style={styles.title}>
+          CONTRATO DE SERVICIO MANTENIMIENTO PREVENTIVO
+        </Text>
+
+        <Text style={styles.paragraph}>
+          Conste por el presente documento EL CONTRATO DE PRESTACION DE
+          SERVICIOS, que celebran de una parte, la Empresa{" "}
+          <Text style={styles.bold}>ACELERA SOLUCIONES S.A.C.</Text> ubicado en
+          Av. Los Incas S/N - Lima, Perú, con RUC.
+          20123456789, representada por el Sr. Frank Ayerve,
+          debidamente identificado con D.N.I. No 70123456, Y de la otra parte{" "}
+          <Text style={styles.bold}>{data.costCenterName}</Text>, ubicado en{" "}
+          {data.costCenterAddress}, {data.costCenterDistrict}, representado por
+          el señor {data.clientSignerName}, identificado con DNI{" "}
+          {data.clientSignerDocument}, en quien en adelante se les denominará{" "}
+          <Text style={styles.bold}>EL CLIENTE</Text>; en los términos y
+          condiciones siguientes:
+        </Text>
+
+        <Text style={styles.paragraph}>
+          <Text style={styles.bold}>PRIMERO.-</Text>{" "}
+          {clause(cc, "clause_1", data)}
+        </Text>
+
+        <View style={styles.list}>
+          {data.elevators.map((elevator, index) => (
+            <View key={index} style={styles.equipmentBlock}>
+              <Text style={styles.equipmentTitle}>
+                {`Equipo ${index + 1} — Código Interno: ${elevator.internalCode || "—"}`}
+              </Text>
+              <View style={styles.equipmentColumns}>
+                <View style={styles.equipmentColumn}>
+                  <Text style={styles.equipmentRow}>
+                    <Text style={styles.equipmentLabel}>Tipo: </Text>
+                    {elevator.type || "—"}
+                  </Text>
+                  <Text style={styles.equipmentRow}>
+                    <Text style={styles.equipmentLabel}>Marca: </Text>
+                    {elevator.brand || "—"}
+                  </Text>
+                  <Text style={styles.equipmentRow}>
+                    <Text style={styles.equipmentLabel}>Modelo: </Text>
+                    {elevator.model || "—"}
+                  </Text>
+                  <Text style={styles.equipmentRow}>
+                    <Text style={styles.equipmentLabel}>Capacidad: </Text>
+                    {elevator.capacityKg != null ? `${elevator.capacityKg} kg` : "—"}
+                  </Text>
+                </View>
+                <View style={styles.equipmentColumn}>
+                  <Text style={styles.equipmentRow}>
+                    <Text style={styles.equipmentLabel}>Personas: </Text>
+                    {elevator.capacityPersons != null ? String(elevator.capacityPersons) : "—"}
+                  </Text>
+                  <Text style={styles.equipmentRow}>
+                    <Text style={styles.equipmentLabel}>Velocidad: </Text>
+                    {elevator.speedMs != null ? `${elevator.speedMs} m/s` : "—"}
+                  </Text>
+                  <Text style={styles.equipmentRow}>
+                    <Text style={styles.equipmentLabel}>Paradas: </Text>
+                    {elevator.stops != null ? String(elevator.stops) : "—"}
+                  </Text>
+                  <Text style={styles.equipmentRow}>
+                    <Text style={styles.equipmentLabel}>Pisos: </Text>
+                    {elevator.floors != null ? String(elevator.floors) : "—"}
+                  </Text>
+                </View>
+              </View>
+            </View>
+          ))}
+          {data.elevatorsCount > 0 && (
+            <Text>• Cantidad: {data.elevatorsCount} ascensor(es)</Text>
+          )}
+        </View>
+
+        <Text style={styles.paragraph}>
+          <Text style={styles.bold}>SEGUNDO.- EL CLIENTE se compromete a:</Text>
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_2_1", data)}
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_2_2", data)}
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_2_3", data)}
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_2_4", data)}
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_2_5", data)}
+        </Text>
+
+        <Text style={styles.paragraph}>
+          <Text style={styles.bold}>
+            TERCERO: ACELERA SOLUCIONES S.A.C. se compromete a:
+          </Text>
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_3_1", data)}
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_3_2", data)}
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_3_3", data)}
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_3_4", data)}
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_3_5", data)}
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_3_6", data)}
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_3_7", data)}
+        </Text>
+        <View style={styles.list}>
+          <Text>
+            {clause(cc, "clause_3_7_1", data)}
+          </Text>
+          <Text>
+            {clause(cc, "clause_3_7_2", data)}
+          </Text>
+        </View>
+
+        <Text style={styles.paragraph}>
+          <Text style={styles.bold}>CUARTO: DISPOSICIONES FINALES</Text>
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_4_1", data)}
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_4_2", data)}
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_4_3", data)}
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_4_4", data)}
+        </Text>
+        <Text style={styles.paragraph}>
+          {clause(cc, "clause_4_5", data)}
+        </Text>
+
+        <Text style={[styles.paragraph, { marginTop: 20 }]}>
+          Conforme con todas las cláusulas anteriores, firman las partes por
+          duplicado en la ciudad de Lima a los {data.currentDay} días del mes de{" "}
+          {data.currentMonth} del {data.currentYear}.
+        </Text>
+
+        {/* Signature blocks */}
+        <View style={styles.signaturesContainer} wrap={false}>
+          <View style={styles.signatureBlock}>
+            <View style={{ height: 60 }} />
+            <Text style={styles.signatureLine}>{data.costCenterName}</Text>
+          </View>
+
+          <View style={styles.signatureBlock}>
+            {data.aceleraSignatureUrl && (
+              <Image src={data.aceleraSignatureUrl} style={styles.signatureImage} />
+            )}
+            <Text style={styles.signatureLine}>ACELERA SOLUCIONES</Text>
+            <Text>FRANK AYERVE</Text>
+            <Text>DNI: 70123456</Text>
+          </View>
+        </View>
+      </Page>
+    </Document>
+  );
+};

@@ -1,0 +1,1376 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { type BatchItem } from "drizzle-orm/batch";
+
+type SqliteBatchItem = BatchItem<"sqlite">;
+import { getSessionUserId } from "@/features/auth/server";
+import {
+  db,
+  clients,
+  costCenters,
+  users,
+  elevatorUnities,
+  serviceTypes,
+  laborConfig,
+  pricingConfig,
+  quotations,
+  quotationLines,
+  quotationLineProducts,
+  quotationImages,
+  type Quotation,
+  type QuotationLine,
+  type QuotationLineProduct,
+} from "@/db/index";
+import { eq, isNull, desc, count, asc, and, inArray } from "drizzle-orm";
+import { generateUuid } from "@/lib/uuid";
+import { getErrorMessage, isUniqueConstraintError } from "@/lib/errors";
+import { generateDocumentNumber } from "@/lib/document-number";
+import {
+  copyPublicObjectByUrl,
+  deleteR2ObjectByUrl,
+  deleteStoredPdf,
+} from "@/lib/r2";
+import { quotationPdfPath } from "@/lib/pdf-paths";
+import {
+  quotationFormSchema,
+  quotationHeaderSchema,
+  stripBlankProducts,
+  type QuotationFormValues,
+  type QuotationHeaderValues,
+} from "./schema";
+import { parseServicePrice } from "@/features/masters/schema";
+import {
+  calculateQuotationLine,
+  calculateQuotationHeader,
+  isManualPassthrough,
+  DEFAULT_PRICING_RULES,
+  type PricingRules,
+} from "./calc";
+import { denyUnless, requirePermission } from "@/features/auth/guard";
+import { loadQuotationDetail, loadQuotationImages } from "./queries";
+
+export interface ActionResult {
+  success: boolean;
+  id?: string;
+  message?: string;
+  error?: string;
+}
+
+const round2 = (value: number) => Math.round(value * 100) / 100;
+const toTimestamp = (dateStr: string): number =>
+  Math.floor(new Date(`${dateStr}T12:00:00`).getTime() / 1000);
+
+// ==========================================
+// COSTO DE MANO DE OBRA (labor_config)
+// ==========================================
+
+export async function getLaborConfig(): Promise<number> {
+  await requirePermission("quotations:read");
+  try {
+    const [row] = await db
+      .select({ hourlyCost: laborConfig.hourlyCost })
+      .from(laborConfig)
+      .limit(1);
+    return row?.hourlyCost ?? 0;
+  } catch (error) {
+    console.error("Error al obtener labor_config:", error);
+    return 0;
+  }
+}
+
+export async function upsertLaborConfig(hourlyCost: number): Promise<ActionResult> {
+  const denied = await denyUnless("quotations:write");
+  if (denied) return denied;
+  try {
+    const cost = round2(Number(hourlyCost) || 0);
+    if (cost < 0) {
+      return { success: false, error: "El costo por hora no puede ser negativo." };
+    }
+    const existing = await db.select({ id: laborConfig.id }).from(laborConfig).limit(1);
+    if (existing.length > 0) {
+      await db
+        .update(laborConfig)
+        .set({ hourlyCost: cost, updatedAt: Math.floor(Date.now() / 1000) })
+        .where(eq(laborConfig.id, existing[0].id));
+    } else {
+      await db.insert(laborConfig).values({ id: "default", hourlyCost: cost });
+    }
+    revalidatePath("/quotations");
+    return { success: true, message: "Costo por hora actualizado." };
+  } catch (error) {
+    console.error("Error al actualizar labor_config:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+// ==========================================
+// CONFIGURACIÓN DE PRECIOS (pricing_config)
+// ==========================================
+
+const PRICING_CONFIG_ID = "default";
+
+function toRules(row: typeof pricingConfig.$inferSelect | undefined): PricingRules {
+  if (!row) return DEFAULT_PRICING_RULES;
+  return {
+    overheadRateLabor: row.overheadRateLabor ?? DEFAULT_PRICING_RULES.overheadRateLabor,
+    overheadRateQuote: row.overheadRateQuote ?? DEFAULT_PRICING_RULES.overheadRateQuote,
+    commissionRate: row.commissionRate ?? DEFAULT_PRICING_RULES.commissionRate,
+    profitRate: row.profitRate ?? DEFAULT_PRICING_RULES.profitRate,
+    igvRate: row.igvRate ?? DEFAULT_PRICING_RULES.igvRate,
+    allowPriceOverride: row.allowPriceOverride ?? true,
+    allowCostOverride: row.allowCostOverride ?? true,
+  };
+}
+
+export async function getPricingConfig(): Promise<PricingRules> {
+  await requirePermission("quotations:read");
+  try {
+    const [row] = await db.select().from(pricingConfig).limit(1);
+    return toRules(row);
+  } catch (error) {
+    console.error("Error al obtener pricing_config:", error);
+    return DEFAULT_PRICING_RULES;
+  }
+}
+
+export type PricingConfigInput = Partial<Omit<PricingRules, never>>;
+
+export async function upsertPricingConfig(input: PricingConfigInput): Promise<ActionResult> {
+  const denied = await denyUnless("quotations:write");
+  if (denied) return denied;
+  try {
+    const values = {
+      overheadRateLabor: Number(input.overheadRateLabor),
+      overheadRateQuote: Number(input.overheadRateQuote),
+      commissionRate: Number(input.commissionRate),
+      profitRate: Number(input.profitRate),
+      igvRate: Number(input.igvRate),
+      allowPriceOverride: Boolean(input.allowPriceOverride),
+      allowCostOverride: Boolean(input.allowCostOverride),
+    };
+
+    for (const [key, value] of Object.entries(values)) {
+      if (typeof value === "number" && (!Number.isFinite(value) || value < 0)) {
+        return { success: false, error: `El valor de "${key}" no es válido.` };
+      }
+    }
+    if (values.igvRate > 1) {
+      return { success: false, error: "El IGV debe expresarse como decimal (0.18 = 18%)." };
+    }
+
+    const updatedAt = Math.floor(Date.now() / 1000);
+    const existing = await db
+      .select({ id: pricingConfig.id })
+      .from(pricingConfig)
+      .limit(1);
+
+    if (existing.length > 0) {
+      await db
+        .update(pricingConfig)
+        .set({ ...values, updatedAt })
+        .where(eq(pricingConfig.id, existing[0].id));
+    } else {
+      await db
+        .insert(pricingConfig)
+        .values({ id: PRICING_CONFIG_ID, ...values, updatedAt });
+    }
+
+    revalidatePath("/quotations");
+    return { success: true, message: "Configuración de precios actualizada." };
+  } catch (error) {
+    console.error("Error al actualizar pricing_config:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+// ==========================================
+// CORRELATIVO
+// ==========================================
+
+async function nextQuotationNumber(): Promise<string> {
+  return generateDocumentNumber("QT", String(new Date().getFullYear()));
+}
+
+// ==========================================
+// LISTADO + DETALLE
+// ==========================================
+
+export type QuotationWithRelations = Quotation & {
+  client_name: string | null;
+  cost_center_name: string | null;
+  advisor_name: string | null;
+  lineCount: number;
+  /** Tipos de servicio distintos que usan sus líneas. */
+  serviceTypes: Array<{ id: string; name: string }>;
+};
+
+/**
+ * Lo que el navegador recibe como `pdfUrl`: la ruta de la app que valida la
+ * sesión y redirige a una URL firmada, nunca la URL del bucket.
+ */
+function clientPdfUrl(row: {
+  id: string;
+  pdfUrl: string | null;
+  pdfKey: string | null;
+  pdfGeneratedAt: number | null;
+}): string | null {
+  return row.pdfKey || row.pdfUrl ? quotationPdfPath(row.id, row.pdfGeneratedAt) : null;
+}
+
+export async function getQuotations(): Promise<QuotationWithRelations[]> {
+  await requirePermission("quotations:read");
+  try {
+    const rows = await db
+      .select({
+        id: quotations.id,
+        quotationNumber: quotations.quotationNumber,
+        clientId: quotations.clientId,
+        costCenterId: quotations.costCenterId,
+        advisorId: quotations.advisorId,
+        issueDate: quotations.issueDate,
+        validUntil: quotations.validUntil,
+        status: quotations.status,
+        discountMode: quotations.discountMode,
+        targetTotal: quotations.targetTotal,
+        targetTotalIncludesIgv: quotations.targetTotalIncludesIgv,
+        discountRate: quotations.discountRate,
+        subtotal: quotations.subtotal,
+        discountAmount: quotations.discountAmount,
+        taxableBase: quotations.taxableBase,
+        igv: quotations.igv,
+        total: quotations.total,
+        welcomeMessage: quotations.welcomeMessage,
+        closeMessage: quotations.closeMessage,
+        paymentTerms: quotations.paymentTerms,
+        executionTime: quotations.executionTime,
+        workingHours: quotations.workingHours,
+        validityDays: quotations.validityDays,
+        showTaxBreakdown: quotations.showTaxBreakdown,
+        configSnapshot: quotations.configSnapshot,
+        pdfUrl: quotations.pdfUrl,
+        pdfKey: quotations.pdfKey,
+        pdfGeneratedAt: quotations.pdfGeneratedAt,
+        createdAt: quotations.createdAt,
+        client_name: clients.legalName,
+        cost_center_name: costCenters.name,
+        advisor_name: users.fullName,
+        lineCount: count(quotationLines.id),
+      })
+      .from(quotations)
+      .innerJoin(clients, eq(quotations.clientId, clients.id))
+      .leftJoin(costCenters, eq(quotations.costCenterId, costCenters.id))
+      .leftJoin(users, eq(quotations.advisorId, users.id))
+      .leftJoin(quotationLines, eq(quotationLines.quotationId, quotations.id))
+      .groupBy(quotations.id)
+      .orderBy(desc(quotations.createdAt));
+
+    const serviceRows = await db
+      .selectDistinct({
+        quotationId: quotationLines.quotationId,
+        id: serviceTypes.id,
+        name: serviceTypes.name,
+      })
+      .from(quotationLines)
+      .innerJoin(serviceTypes, eq(quotationLines.serviceTypeId, serviceTypes.id))
+      .orderBy(asc(serviceTypes.name));
+    const servicesByQuotation = new Map<string, Array<{ id: string; name: string }>>();
+    for (const { quotationId, ...service } of serviceRows) {
+      const list = servicesByQuotation.get(quotationId) ?? [];
+      list.push(service);
+      servicesByQuotation.set(quotationId, list);
+    }
+
+    return rows.map((row) => ({
+      ...row,
+      pdfUrl: clientPdfUrl(row),
+      serviceTypes: servicesByQuotation.get(row.id) ?? [],
+    }));
+  } catch (error) {
+    console.error("Error al obtener cotizaciones:", error);
+    return [];
+  }
+}
+
+export interface ClientQuotationOption {
+  id: string;
+  quotationNumber: string;
+  issueDate: number;
+  total: number | null;
+  status: string | null;
+  costCenterName: string | null;
+  lineCount: number;
+}
+
+/**
+ * Cotizaciones previas del cliente para ofrecerlas como origen de una copia.
+ * Solo devuelve lo necesario para el selector; el preview carga el detalle
+ * aparte y la copia se valida de nuevo en el servidor.
+ */
+export async function getClientQuotationsForCopy(
+  clientId: string
+): Promise<ClientQuotationOption[]> {
+  await requirePermission("quotations:read");
+  if (!clientId) return [];
+  try {
+    const rows = await db
+      .select({
+        id: quotations.id,
+        quotationNumber: quotations.quotationNumber,
+        issueDate: quotations.issueDate,
+        total: quotations.total,
+        status: quotations.status,
+        costCenterName: costCenters.name,
+        lineCount: count(quotationLines.id),
+      })
+      .from(quotations)
+      .leftJoin(costCenters, eq(quotations.costCenterId, costCenters.id))
+      .leftJoin(quotationLines, eq(quotationLines.quotationId, quotations.id))
+      .where(eq(quotations.clientId, clientId))
+      .groupBy(quotations.id)
+      .orderBy(desc(quotations.createdAt))
+      .limit(100);
+    return rows;
+  } catch (error) {
+    console.error("Error al obtener cotizaciones del cliente:", error);
+    return [];
+  }
+}
+
+export type LineModeSummary =
+  | "ALL_CALCULATED"
+  | "MANUAL_PRICE"
+  | "PASSTHROUGH"
+  | "MIXED";
+
+/**
+ * Devuelve, para cada cotización, un resumen de los modos de línea que usan sus
+ * items. MANUAL_PRICE con proveedor y costo se clasifica como PASSTHROUGH.
+ */
+export async function getQuotationLineModeSummary(): Promise<Record<string, LineModeSummary>> {
+  await requirePermission("quotations:read");
+  try {
+    const rows = await db
+      .select({
+        quotationId: quotationLines.quotationId,
+        lineMode: quotationLines.lineMode,
+        supplierName: quotationLines.supplierName,
+        supplierCost: quotationLines.supplierCost,
+      })
+      .from(quotationLines);
+
+    const sets = new Map<string, Set<string>>();
+    for (const row of rows) {
+      const mode =
+        isManualPassthrough(row.lineMode, row.supplierName, row.supplierCost)
+          ? "PASSTHROUGH"
+          : (row.lineMode ?? "CALCULATED");
+      const set = sets.get(row.quotationId) ?? new Set<string>();
+      set.add(mode);
+      sets.set(row.quotationId, set);
+    }
+
+    const summary: Record<string, LineModeSummary> = {};
+    for (const [quotationId, set] of sets) {
+      if (set.size === 1) {
+        const only = [...set][0];
+        summary[quotationId] = only === "CALCULATED" ? "ALL_CALCULATED" : (only as LineModeSummary);
+      } else {
+        summary[quotationId] = "MIXED";
+      }
+    }
+    return summary;
+  } catch (error) {
+    console.error("Error al obtener resumen de modos de línea:", error);
+    return {};
+  }
+}
+
+export type QuotationLineWithRelations = QuotationLine & {
+  elevator_name: string | null;
+  elevator_internal_code: string | null;
+  service_type_name: string | null;
+  products: QuotationLineProduct[];
+};
+
+export type QuotationDetail = Quotation & {
+  client_name: string | null;
+  client_tax_id: string | null;
+  cost_center_name: string | null;
+  cost_center_address: string | null;
+  cost_center_district: string | null;
+  advisor_name: string | null;
+  lines: QuotationLineWithRelations[];
+};
+
+export async function getQuotationById(id: string): Promise<QuotationDetail | null> {
+  await requirePermission("quotations:read");
+  const detail = await loadQuotationDetail(id);
+  return detail ? { ...detail, pdfUrl: clientPdfUrl(detail) } : null;
+}
+
+// ==========================================
+// DATA PARA EL FORMULARIO
+// ==========================================
+
+export interface QuotationFormOptions {
+  clients: Array<{ id: string; legalName: string | null; taxId: string | null }>;
+  costCenters: Array<{
+    id: string;
+    clientId: string;
+    name: string | null;
+    clientName: string | null;
+    address: string | null;
+  }>;
+  advisors: Array<{ id: string; fullName: string | null }>;
+  equipment: Array<{
+    id: string;
+    costCenterId: string;
+    internalCode: string | null;
+    name: string | null;
+  }>;
+  /**
+   * Tipos de servicio activos. Solo los marcados `showInQuotations` se ofrecen al
+   * elegir; el resto viaja para poder nombrar los que ya usa alguna línea.
+   */
+  serviceTypes: Array<{
+    id: string;
+    code: string;
+    name: string;
+    /** Precio estandarizado, si el servicio tiene uno. */
+    price: number | null;
+    showInQuotations: boolean;
+  }>;
+  pricing: PricingRules;
+}
+
+export async function getQuotationFormData(): Promise<QuotationFormOptions> {
+  await requirePermission("quotations:read");
+  const [clientRows, costCenterRows, advisorRows, equipmentRows, serviceTypeRows] = await Promise.all([
+    db
+      .select({ id: clients.id, legalName: clients.legalName, taxId: clients.taxId })
+      .from(clients)
+      .where(and(eq(clients.status, "ACTIVE"), isNull(clients.deletedAt)))
+      .orderBy(asc(clients.legalName)),
+    db
+      .select({
+        id: costCenters.id,
+        clientId: costCenters.clientId,
+        name: costCenters.name,
+        clientName: clients.legalName,
+        address: costCenters.address,
+      })
+      .from(costCenters)
+      .innerJoin(clients, eq(costCenters.clientId, clients.id))
+      .where(and(isNull(costCenters.deletedAt), isNull(clients.deletedAt)))
+      .orderBy(asc(costCenters.name)),
+    db
+      .select({ id: users.id, fullName: users.fullName })
+      .from(users)
+      .where(eq(users.status, "ACTIVE"))
+      .orderBy(asc(users.fullName)),
+    db
+      .select({
+        id: elevatorUnities.id,
+        costCenterId: elevatorUnities.costCenterId,
+        internalCode: elevatorUnities.internalCode,
+        name: elevatorUnities.name,
+      })
+      .from(elevatorUnities)
+      .where(isNull(elevatorUnities.deletedAt))
+      .orderBy(asc(elevatorUnities.internalCode)),
+    db
+      .select({
+        id: serviceTypes.id,
+        code: serviceTypes.code,
+        name: serviceTypes.name,
+        price: serviceTypes.price,
+        showInQuotations: serviceTypes.showInQuotations,
+      })
+      .from(serviceTypes)
+      .where(eq(serviceTypes.isActive, true))
+      .orderBy(asc(serviceTypes.name)),
+  ]);
+
+  return {
+    clients: clientRows,
+    costCenters: costCenterRows.map((c) => ({
+      id: c.id,
+      clientId: c.clientId,
+      name: c.name,
+      clientName: c.clientName,
+      address: c.address,
+    })),
+    advisors: advisorRows,
+    equipment: equipmentRows,
+    serviceTypes: serviceTypeRows.map((s) => ({
+      id: s.id,
+      code: s.code,
+      name: s.name,
+      price: parseServicePrice(s.price),
+      showInQuotations: s.showInQuotations ?? false,
+    })),
+    pricing: await getPricingConfig(),
+  };
+}
+
+// ==========================================
+// CREAR / ACTUALIZAR / ELIMINAR
+// ==========================================
+
+async function resolveAdvisorId(value: string | null | undefined): Promise<string | null> {
+  const trimmed = (value ?? "").trim();
+  if (trimmed) return trimmed;
+  try {
+    return await getSessionUserId();
+  } catch {
+    return null;
+  }
+}
+
+async function buildQuotationData(validated: QuotationFormValues, hourlyCostOverride?: number) {
+  const rules = await getPricingConfig();
+  const hourlyCost =
+    typeof hourlyCostOverride === "number" ? hourlyCostOverride : await getLaborConfig();
+
+  const lines = validated.lines.map((l, i) => {
+    const lineHourlyCost = Number(l.hourlyCost) || 0;
+    const calc = calculateQuotationLine(
+      {
+        totalHours: Number(l.totalHours),
+        hourlyCost: lineHourlyCost,
+        lineMode: l.lineMode,
+        manualPrice: Number(l.manualPrice) || null,
+        manualPriceIncludesIgv: l.manualPriceIncludesIgv ?? true,
+        supplierName: l.supplierName || null,
+        supplierCost: Number(l.supplierCost) || null,
+        lineOverridePrice: l.overridePrice ? Number(l.lineOverridePrice) || null : null,
+        discountMode: l.discountMode,
+        discountValue: Number(l.discountValue) || 0,
+        products: l.products.map((p) => ({
+          quantity: Number(p.quantity),
+          unitCost: Number(p.unitCost),
+        })),
+      },
+      lineHourlyCost,
+      rules
+    );
+
+    return {
+      elevatorUnityId: l.elevatorUnityId || null,
+      serviceTypeId: l.serviceTypeId || null,
+      description: l.description,
+      orderIndex: i,
+      lineMode: calc.lineMode,
+      isPassthrough: calc.isPassthrough,
+      lineModeReason: l.lineModeReason?.trim() || null,
+      manualPrice: calc.manualPrice,
+      manualPriceIncludesIgv: calc.manualPriceIncludesIgv,
+      supplierName: l.supplierName?.trim() || null,
+      supplierCost: calc.supplierCost || null,
+      lineOverridePrice:
+        l.overridePrice && Number(l.lineOverridePrice) > 0
+          ? round2(Number(l.lineOverridePrice))
+          : null,
+      lineOverrideReason: l.lineOverrideReason?.trim() || null,
+      lineDiscountMode: calc.discountMode === "NONE" ? null : calc.discountMode,
+      lineDiscountValue: calc.discountMode === "NONE" ? null : calc.discountValue,
+      lineDiscountAmount: calc.discountAmount,
+      totalHours: Number(l.totalHours),
+      hourlyCost: calc.hourlyCostUsed,
+      laborCost: calc.laborCost,
+      productCost: calc.productCost,
+      subtotal: calc.subtotal,
+      overheadRate: calc.overheadRate,
+      overheadAmount: calc.overheadAmount,
+      totalCost: calc.totalCost,
+      commissionRate: calc.commissionRate,
+      commissionAmount: calc.commissionAmount,
+      profitRate: calc.profitRate,
+      profitAmount: calc.profitAmount,
+      clientValue: calc.clientValue,
+      igv: calc.igv,
+      clientPrice: calc.clientPrice,
+      products:
+        l.lineMode === "MANUAL_PRICE"
+          ? []
+          : l.products.map((p, j) => ({
+              description: p.description,
+              quantity: Number(p.quantity),
+              unit: p.unit || null,
+              unitCost: Number(p.unitCost),
+              totalCost: round2(Number(p.quantity) * Number(p.unitCost)),
+              orderIndex: j,
+            })),
+    };
+  });
+
+  const header = calculateQuotationHeader(
+    lines.map((l) => ({ clientValue: l.clientValue })),
+    {
+      discountMode: validated.discountMode,
+      discountRate: Number(validated.discountRate) || 0,
+      discountAmount: Number(validated.discountAmount) || 0,
+      targetTotal: Number(validated.targetTotal) || null,
+      targetTotalIncludesIgv: validated.targetTotalIncludesIgv,
+      igvRate: rules.igvRate,
+    },
+    rules
+  );
+
+  return {
+    clientId: validated.clientId,
+    costCenterId: validated.costCenterId || null,
+    advisorId: validated.advisorId || undefined,
+    issueDate: toTimestamp(validated.issueDate),
+    validUntil: toTimestamp(validated.validUntil),
+    status: validated.status || "DRAFT",
+    discountMode: header.discountMode,
+    targetTotal:
+      validated.discountMode === "FINAL" && Number(validated.targetTotal) > 0
+        ? round2(Number(validated.targetTotal))
+        : null,
+    targetTotalIncludesIgv: validated.targetTotalIncludesIgv ?? true,
+    discountRate: header.discountRate,
+    subtotal: header.subtotal,
+    discountAmount: header.discountAmount,
+    taxableBase: header.taxableBase,
+    igv: header.igv,
+    total: header.total,
+    showTaxBreakdown: validated.showTaxBreakdown ?? true,
+    configSnapshot: JSON.stringify({
+      overheadRate: rules.overheadRateQuote,
+      commissionRate: rules.commissionRate,
+      profitRate: rules.profitRate,
+      igvRate: rules.igvRate,
+      hourlyCost,
+      capturedAt: Math.floor(Date.now() / 1000),
+    }),
+    lines,
+  };
+}
+
+/**
+ * Validaciones de línea en el servidor. El formulario ya las aplica con Zod,
+ * pero se repiten aquí porque la cotización se recalcula y persiste en el
+ * backend: nunca se confía en lo que envía el cliente.
+ */
+function validateLineRules(validated: QuotationFormValues): string | null {
+  for (const [index, line] of validated.lines.entries()) {
+    const n = index + 1;
+
+    if (line.discountMode === "PERCENT" && Number(line.discountValue) > 100) {
+      return `Línea ${n}: el descuento debe estar entre 0% y 100%.`;
+    }
+
+    if (line.lineMode === "MANUAL_PRICE") {
+      if (!(Number(line.manualPrice) > 0)) {
+        return `Línea ${n}: falta el precio final.`;
+      }
+      const hasSupplierName = !!line.supplierName?.trim();
+      const hasSupplierCost = Number(line.supplierCost) > 0;
+      if (hasSupplierName || hasSupplierCost) {
+        if (!hasSupplierName) return `Línea ${n}: falta el nombre del proveedor.`;
+        if (!hasSupplierCost) return `Línea ${n}: falta el costo del proveedor.`;
+      }
+      continue;
+    }
+
+    const hasProducts = line.products.some(
+      (p) => p.description.trim() !== "" && Number(p.unitCost) > 0
+    );
+    if (!(Number(line.totalHours) > 0) && !hasProducts) {
+      return `Línea ${n}: la línea no tiene horas ni materiales.`;
+    }
+    if (line.overridePrice && !(Number(line.lineOverridePrice) > 0)) {
+      return `Línea ${n}: falta el precio final del override.`;
+    }
+  }
+  return null;
+}
+
+function validateDiscountRules(
+  validated: QuotationFormValues,
+  payload: Awaited<ReturnType<typeof buildQuotationData>>
+): string | null {
+  for (const [index, line] of payload.lines.entries()) {
+    if (line.lineDiscountAmount > 0 && !(line.clientPrice > 0)) {
+      return `Línea ${index + 1}: el descuento no puede ser igual o mayor al precio.`;
+    }
+  }
+  const subtotal = round2(payload.lines.reduce((sum, line) => sum + line.clientValue, 0));
+  const snapshot = payload.configSnapshot
+    ? (JSON.parse(payload.configSnapshot) as { igvRate?: number })
+    : {};
+  const igvRate = snapshot.igvRate ?? DEFAULT_PRICING_RULES.igvRate;
+  const discountMode = validated.discountMode ?? "PERCENT";
+  if (discountMode === "PERCENT") {
+    const rate = Number(validated.discountRate) || 0;
+    if (rate < 0 || rate > 100) return "El descuento debe estar entre 0% y 100%.";
+  }
+  if (discountMode === "AMOUNT") {
+    const amount = Number(validated.discountAmount) || 0;
+    if (amount > subtotal) return "El descuento no puede ser mayor al subtotal.";
+  }
+  if (discountMode === "FINAL") {
+    const target = Number(validated.targetTotal) || 0;
+    if (target <= 0) return "Ingresa el precio final.";
+    const comparableTarget = validated.targetTotalIncludesIgv
+      ? target
+      : round2(target * (1 + igvRate));
+    if (comparableTarget > round2(subtotal * (1 + igvRate))) {
+      return "El precio final no puede ser mayor al subtotal con IGV.";
+    }
+  }
+  return null;
+}
+
+export async function createQuotation(
+  data: QuotationFormValues
+): Promise<ActionResult> {
+  const denied = await denyUnless("quotations:write");
+  if (denied) return denied;
+  try {
+    const parsed = quotationFormSchema.parse({
+      ...data,
+      lines: stripBlankProducts(data.lines),
+    });
+    const validated = {
+      ...parsed,
+      advisorId: (await resolveAdvisorId(parsed.advisorId)) ?? undefined,
+      status: "DRAFT",
+    } as QuotationFormValues;
+    const lineError = validateLineRules(validated);
+    if (lineError) return { success: false, error: lineError };
+    const payload = await buildQuotationData(validated);
+    const discountError = validateDiscountRules(validated, payload);
+    if (discountError) return { success: false, error: discountError };
+    const quotationId = generateUuid();
+    const insertQuotation = (quotationNumber: string): SqliteBatchItem =>
+      db.insert(quotations).values({
+        id: quotationId,
+        quotationNumber,
+        clientId: payload.clientId,
+        costCenterId: payload.costCenterId,
+        advisorId: payload.advisorId,
+        issueDate: payload.issueDate,
+        validUntil: payload.validUntil,
+        status: payload.status,
+        discountMode: payload.discountMode,
+        targetTotal: payload.targetTotal,
+        targetTotalIncludesIgv: payload.targetTotalIncludesIgv,
+        discountRate: payload.discountRate,
+        subtotal: payload.subtotal,
+        discountAmount: payload.discountAmount,
+        taxableBase: payload.taxableBase,
+        igv: payload.igv,
+        total: payload.total,
+        showTaxBreakdown: payload.showTaxBreakdown,
+        configSnapshot: payload.configSnapshot,
+      });
+
+    const statements: SqliteBatchItem[] = [];
+
+    for (const line of payload.lines) {
+      const lineId = generateUuid();
+      statements.push(
+        db.insert(quotationLines).values({
+          id: lineId,
+          quotationId,
+          elevatorUnityId: line.elevatorUnityId,
+          serviceTypeId: line.serviceTypeId,
+          description: line.description,
+          orderIndex: line.orderIndex,
+          lineMode: line.lineMode,
+          lineModeReason: line.lineModeReason,
+          manualPrice: line.manualPrice,
+          manualPriceIncludesIgv: line.manualPriceIncludesIgv,
+          supplierName: line.supplierName,
+          supplierCost: line.supplierCost,
+          lineOverridePrice: line.lineOverridePrice,
+          lineOverrideReason: line.lineOverrideReason,
+          lineDiscountMode: line.lineDiscountMode,
+          lineDiscountValue: line.lineDiscountValue,
+          lineDiscountAmount: line.lineDiscountAmount,
+          totalHours: line.totalHours,
+          hourlyCost: line.hourlyCost,
+          laborCost: line.laborCost,
+          productCost: line.productCost,
+          subtotal: line.subtotal,
+          overheadRate: line.overheadRate,
+          overheadAmount: line.overheadAmount,
+          totalCost: line.totalCost,
+          commissionRate: line.commissionRate,
+          commissionAmount: line.commissionAmount,
+          profitRate: line.profitRate,
+          profitAmount: line.profitAmount,
+          clientValue: line.clientValue,
+          igv: line.igv,
+          clientPrice: line.clientPrice,
+        })
+      );
+      for (const product of line.products) {
+        statements.push(
+          db.insert(quotationLineProducts).values({
+            id: generateUuid(),
+            quotationLineId: lineId,
+            description: product.description,
+            quantity: product.quantity,
+            unit: product.unit,
+            unitCost: product.unitCost,
+            totalCost: product.totalCost,
+            orderIndex: product.orderIndex,
+          })
+        );
+      }
+    }
+
+    // Número aleatorio con reintento ante colisión del índice UNIQUE.
+    const maxAttempts = 5;
+    let quotationNumber = "";
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      quotationNumber = await nextQuotationNumber();
+      try {
+        await db.batch(
+          [insertQuotation(quotationNumber), ...statements] as unknown as [SqliteBatchItem, ...SqliteBatchItem[]]
+        );
+        break;
+      } catch (error) {
+        if (isUniqueConstraintError(error) && attempt < maxAttempts) continue;
+        throw error;
+      }
+    }
+    revalidatePath("/quotations");
+    return { success: true, id: quotationId, message: `Cotización ${quotationNumber} creada` };
+  } catch (error) {
+    console.error("Error al crear cotización:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+function imageExtensionFromUrl(url: string): string {
+  try {
+    const ext = new URL(url).pathname.split(".").pop()?.toLowerCase() ?? "";
+    return ["jpg", "jpeg", "png", "webp"].includes(ext) ? ext : "jpg";
+  } catch {
+    return "jpg";
+  }
+}
+
+/**
+ * Crea una cotización nueva copiando una existente del mismo cliente.
+ *
+ * Se copian las filas tal cual (líneas, productos, importes y descuentos), los
+ * mensajes y condiciones del documento, y las imágenes referenciales. La
+ * cabecera elegida en el formulario manda sobre cliente, sede, asesor y fechas;
+ * el estado de la copia siempre es DRAFT y su número es nuevo. No se copia el
+ * PDF: se regenerará con los datos de la nueva cotización.
+ */
+export async function duplicateQuotation(
+  sourceId: string,
+  data: QuotationHeaderValues
+): Promise<ActionResult> {
+  const denied = await denyUnless("quotations:write");
+  if (denied) return denied;
+  try {
+    const validated = quotationHeaderSchema.parse(data);
+    const [source] = await db
+      .select()
+      .from(quotations)
+      .where(eq(quotations.id, sourceId))
+      .limit(1);
+    if (!source) {
+      return { success: false, error: "La cotización de origen ya no existe." };
+    }
+    if (source.clientId !== validated.clientId) {
+      return {
+        success: false,
+        error: "Solo puedes copiar cotizaciones del mismo cliente.",
+      };
+    }
+    if (validated.costCenterId) {
+      const [center] = await db
+        .select({ id: costCenters.id })
+        .from(costCenters)
+        .where(
+          and(
+            eq(costCenters.id, validated.costCenterId),
+            eq(costCenters.clientId, validated.clientId)
+          )
+        )
+        .limit(1);
+      if (!center) {
+        return { success: false, error: "La sede no pertenece al cliente seleccionado." };
+      }
+    }
+
+    const sourceLines = await db
+      .select()
+      .from(quotationLines)
+      .where(eq(quotationLines.quotationId, sourceId))
+      .orderBy(asc(quotationLines.orderIndex));
+    const sourceProducts: QuotationLineProduct[] =
+      sourceLines.length > 0
+        ? ((await db
+            .select()
+            .from(quotationLineProducts)
+            .where(
+              inArray(
+                quotationLineProducts.quotationLineId,
+                sourceLines.map((line) => line.id)
+              )
+            )
+            .orderBy(asc(quotationLineProducts.orderIndex))) as QuotationLineProduct[])
+        : [];
+    const productsByLine = new Map<string, QuotationLineProduct[]>();
+    for (const product of sourceProducts) {
+      const list = productsByLine.get(product.quotationLineId) ?? [];
+      list.push(product);
+      productsByLine.set(product.quotationLineId, list);
+    }
+    const sourceImages = await loadQuotationImages(sourceId);
+
+    const quotationId = generateUuid();
+    const copiedImageUrls: string[] = [];
+    try {
+      const imageRows: Array<typeof quotationImages.$inferInsert> = [];
+      for (const image of sourceImages) {
+        const imageId = generateUuid();
+        const key = `quotations/images/${quotationId}/${imageId}.${imageExtensionFromUrl(image.url)}`;
+        const url = await copyPublicObjectByUrl(image.url, key);
+        copiedImageUrls.push(url);
+        imageRows.push({
+          ...image,
+          id: imageId,
+          quotationId,
+          url,
+          createdAt: undefined,
+        });
+      }
+
+      const statements: SqliteBatchItem[] = [];
+      for (const line of sourceLines) {
+        const lineId = generateUuid();
+        statements.push(
+          db.insert(quotationLines).values({
+            ...line,
+            id: lineId,
+            quotationId,
+            createdAt: undefined,
+          })
+        );
+        for (const product of productsByLine.get(line.id) ?? []) {
+          statements.push(
+            db.insert(quotationLineProducts).values({
+              ...product,
+              id: generateUuid(),
+              quotationLineId: lineId,
+            })
+          );
+        }
+      }
+      for (const image of imageRows) {
+        statements.push(db.insert(quotationImages).values(image));
+      }
+
+      const targetAdvisorId = (await resolveAdvisorId(validated.advisorId)) ?? undefined;
+      const insertQuotation = (quotationNumber: string): SqliteBatchItem =>
+        db.insert(quotations).values({
+          id: quotationId,
+          quotationNumber,
+          clientId: validated.clientId,
+          costCenterId: validated.costCenterId || null,
+          advisorId: targetAdvisorId,
+          issueDate: toTimestamp(validated.issueDate),
+          validUntil: toTimestamp(validated.validUntil),
+          status: "DRAFT",
+          discountMode: source.discountMode,
+          targetTotal: source.targetTotal,
+          targetTotalIncludesIgv: source.targetTotalIncludesIgv,
+          discountRate: source.discountRate,
+          subtotal: source.subtotal,
+          discountAmount: source.discountAmount,
+          taxableBase: source.taxableBase,
+          igv: source.igv,
+          total: source.total,
+          welcomeMessage: source.welcomeMessage,
+          closeMessage: source.closeMessage,
+          paymentTerms: source.paymentTerms,
+          executionTime: source.executionTime,
+          workingHours: source.workingHours,
+          validityDays: source.validityDays,
+          showTaxBreakdown: source.showTaxBreakdown,
+          configSnapshot: source.configSnapshot,
+        });
+
+      const maxAttempts = 5;
+      let quotationNumber = "";
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        quotationNumber = await nextQuotationNumber();
+        try {
+          await db.batch(
+            [insertQuotation(quotationNumber), ...statements] as unknown as [
+              SqliteBatchItem,
+              ...SqliteBatchItem[],
+            ]
+          );
+          break;
+        } catch (error) {
+          if (isUniqueConstraintError(error) && attempt < maxAttempts) continue;
+          throw error;
+        }
+      }
+
+      revalidatePath("/quotations");
+      return {
+        success: true,
+        id: quotationId,
+        message: `Cotización ${quotationNumber} creada como copia de ${source.quotationNumber}`,
+      };
+    } catch (error) {
+      if (copiedImageUrls.length > 0) {
+        await Promise.allSettled(copiedImageUrls.map((url) => deleteR2ObjectByUrl(url)));
+      }
+      throw error;
+    }
+  } catch (error) {
+    console.error("Error al copiar cotización:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function updateQuotation(
+  id: string,
+  data: QuotationFormValues
+): Promise<ActionResult> {
+  const denied = await denyUnless("quotations:write");
+  if (denied) return denied;
+  try {
+    const parsed = quotationFormSchema.parse({
+      ...data,
+      lines: stripBlankProducts(data.lines),
+    });
+    const validated = {
+      ...parsed,
+      advisorId: (await resolveAdvisorId(parsed.advisorId)) ?? undefined,
+    } as QuotationFormValues;
+    const lineError = validateLineRules(validated);
+    if (lineError) return { success: false, error: lineError };
+    const payload = await buildQuotationData(validated);
+    const discountError = validateDiscountRules(validated, payload);
+    if (discountError) return { success: false, error: discountError };
+
+    const existing = await db
+      .select({ id: quotations.id, pdfUrl: quotations.pdfUrl, pdfKey: quotations.pdfKey })
+      .from(quotations)
+      .where(eq(quotations.id, id))
+      .limit(1);
+    if (existing.length === 0) {
+      return { success: false, error: "Cotización no encontrada." };
+    }
+
+    await db
+      .update(quotations)
+      .set({
+        clientId: payload.clientId,
+        costCenterId: payload.costCenterId,
+        advisorId: payload.advisorId,
+        issueDate: payload.issueDate,
+        validUntil: payload.validUntil,
+        status: payload.status,
+        discountMode: payload.discountMode,
+        targetTotal: payload.targetTotal,
+        targetTotalIncludesIgv: payload.targetTotalIncludesIgv,
+        discountRate: payload.discountRate,
+        subtotal: payload.subtotal,
+        discountAmount: payload.discountAmount,
+        taxableBase: payload.taxableBase,
+        igv: payload.igv,
+        total: payload.total,
+        showTaxBreakdown: payload.showTaxBreakdown,
+        pdfUrl: null,
+        pdfKey: null,
+        pdfGeneratedAt: null,
+      })
+      .where(eq(quotations.id, id));
+
+    await db.delete(quotationLines).where(eq(quotationLines.quotationId, id));
+
+    const statements: SqliteBatchItem[] = [];
+    for (const line of payload.lines) {
+      const lineId = generateUuid();
+      statements.push(
+        db.insert(quotationLines).values({
+          id: lineId,
+          quotationId: id,
+          elevatorUnityId: line.elevatorUnityId,
+          serviceTypeId: line.serviceTypeId,
+          description: line.description,
+          orderIndex: line.orderIndex,
+          lineMode: line.lineMode,
+          lineModeReason: line.lineModeReason,
+          manualPrice: line.manualPrice,
+          manualPriceIncludesIgv: line.manualPriceIncludesIgv,
+          supplierName: line.supplierName,
+          supplierCost: line.supplierCost,
+          lineOverridePrice: line.lineOverridePrice,
+          lineOverrideReason: line.lineOverrideReason,
+          lineDiscountMode: line.lineDiscountMode,
+          lineDiscountValue: line.lineDiscountValue,
+          lineDiscountAmount: line.lineDiscountAmount,
+          totalHours: line.totalHours,
+          hourlyCost: line.hourlyCost,
+          laborCost: line.laborCost,
+          productCost: line.productCost,
+          subtotal: line.subtotal,
+          overheadRate: line.overheadRate,
+          overheadAmount: line.overheadAmount,
+          totalCost: line.totalCost,
+          commissionRate: line.commissionRate,
+          commissionAmount: line.commissionAmount,
+          profitRate: line.profitRate,
+          profitAmount: line.profitAmount,
+          clientValue: line.clientValue,
+          igv: line.igv,
+          clientPrice: line.clientPrice,
+        })
+      );
+      for (const product of line.products) {
+        statements.push(
+          db.insert(quotationLineProducts).values({
+            id: generateUuid(),
+            quotationLineId: lineId,
+            description: product.description,
+            quantity: product.quantity,
+            unit: product.unit,
+            unitCost: product.unitCost,
+            totalCost: product.totalCost,
+            orderIndex: product.orderIndex,
+          })
+        );
+      }
+    }
+
+    if (statements.length > 0) {
+      await db.batch(statements as unknown as [SqliteBatchItem, ...SqliteBatchItem[]]);
+    }
+    await deleteStoredPdf({ url: existing[0].pdfUrl, key: existing[0].pdfKey });
+    revalidatePath("/quotations");
+    revalidatePath(`/quotations/${id}`);
+    return { success: true, message: "Cotización actualizada" };
+  } catch (error) {
+    console.error("Error al actualizar cotización:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+/**
+ * Actualiza solo los datos generales (cliente, sede, asesor, fechas, estado).
+ * Las líneas y los descuentos se editan en el detalle. Si cambia el cliente o la
+ * sede, las líneas cuyo equipo quedó fuera de ese alcance pierden el equipo.
+ */
+export async function updateQuotationHeader(
+  id: string,
+  data: QuotationHeaderValues
+): Promise<ActionResult> {
+  const denied = await denyUnless("quotations:write");
+  if (denied) return denied;
+  try {
+    const validated = quotationHeaderSchema.parse(data);
+    const [existing] = await db
+      .select({
+        id: quotations.id,
+        status: quotations.status,
+        pdfUrl: quotations.pdfUrl,
+        pdfKey: quotations.pdfKey,
+      })
+      .from(quotations)
+      .where(eq(quotations.id, id))
+      .limit(1);
+    if (!existing) return { success: false, error: "Cotización no encontrada." };
+
+    const costCenterId = validated.costCenterId || null;
+    await db
+      .update(quotations)
+      .set({
+        clientId: validated.clientId,
+        costCenterId,
+        advisorId: (await resolveAdvisorId(validated.advisorId)) ?? undefined,
+        issueDate: toTimestamp(validated.issueDate),
+        validUntil: toTimestamp(validated.validUntil),
+        status: validated.status || existing.status || "DRAFT",
+        pdfUrl: null,
+        pdfKey: null,
+        pdfGeneratedAt: null,
+      })
+      .where(eq(quotations.id, id));
+
+    const lineEquipment = await db
+      .select({ lineId: quotationLines.id, costCenterId: elevatorUnities.costCenterId })
+      .from(quotationLines)
+      .innerJoin(elevatorUnities, eq(quotationLines.elevatorUnityId, elevatorUnities.id))
+      .where(eq(quotationLines.quotationId, id));
+    if (lineEquipment.length > 0) {
+      const scope = costCenterId
+        ? new Set([costCenterId])
+        : new Set(
+            (
+              await db
+                .select({ id: costCenters.id })
+                .from(costCenters)
+                .where(eq(costCenters.clientId, validated.clientId))
+            ).map((c) => c.id)
+          );
+      const outOfScope = lineEquipment
+        .filter((l) => !scope.has(l.costCenterId))
+        .map((l) => l.lineId);
+      if (outOfScope.length > 0) {
+        await db
+          .update(quotationLines)
+          .set({ elevatorUnityId: null })
+          .where(inArray(quotationLines.id, outOfScope));
+      }
+    }
+
+    await deleteStoredPdf({ url: existing.pdfUrl, key: existing.pdfKey });
+    revalidatePath("/quotations");
+    revalidatePath(`/quotations/${id}`);
+    return { success: true, message: "Datos generales actualizados" };
+  } catch (error) {
+    console.error("Error al actualizar datos generales de cotización:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function updateQuotationDocument(
+  id: string,
+  input: {
+    welcomeMessage?: string;
+    closeMessage?: string;
+    paymentTerms?: string;
+    executionTime?: string;
+    workingHours?: string;
+    validityDays?: number;
+  }
+): Promise<ActionResult> {
+  const denied = await denyUnless("quotations:write");
+  if (denied) return denied;
+  try {
+    const validityDays = Math.max(1, Math.round(Number(input.validityDays) || 15));
+    await db
+      .update(quotations)
+      .set({
+        welcomeMessage: input.welcomeMessage?.trim() || null,
+        closeMessage: input.closeMessage?.trim() || null,
+        paymentTerms: input.paymentTerms?.trim() || null,
+        executionTime: input.executionTime?.trim() || null,
+        workingHours: input.workingHours?.trim() || null,
+        validityDays,
+        pdfUrl: null,
+        pdfKey: null,
+        pdfGeneratedAt: null,
+      })
+      .where(eq(quotations.id, id));
+    revalidatePath("/quotations");
+    revalidatePath(`/quotations/${id}`);
+    return { success: true, message: "Documento actualizado" };
+  } catch (error) {
+    console.error("Error al actualizar documento de cotización:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function issueQuotation(id: string): Promise<ActionResult> {
+  const denied = await denyUnless("quotations:write");
+  if (denied) return denied;
+  try {
+    const quotation = await loadQuotationDetail(id);
+    if (!quotation) return { success: false, error: "Cotización no encontrada." };
+    if (!quotation.clientId || !quotation.costCenterId || quotation.lines.length === 0) {
+      return { success: false, error: "La cotización debe tener cliente, sede y al menos una línea." };
+    }
+    await db.update(quotations).set({ status: "SENT", pdfGeneratedAt: null }).where(eq(quotations.id, id));
+    const { storeQuotationPdf: generateAndStoreQuotationPdf } = await import("./pdf");
+    const pdf = await generateAndStoreQuotationPdf(id);
+    if (!pdf.success) return { success: false, error: pdf.error };
+    revalidatePath("/quotations");
+    revalidatePath(`/quotations/${id}`);
+    return { success: true, message: "Cotización emitida y PDF generado" };
+  } catch (error) {
+    console.error("Error al emitir cotización:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function getQuotationImages(quotationId: string) {
+  await requirePermission("quotations:read");
+  return loadQuotationImages(quotationId);
+}
+
+export async function deleteQuotation(id: string): Promise<ActionResult> {
+  const denied = await denyUnless("quotations:write");
+  if (denied) return denied;
+  try {
+    const [existing] = await db
+      .select({ pdfUrl: quotations.pdfUrl, pdfKey: quotations.pdfKey })
+      .from(quotations)
+      .where(eq(quotations.id, id))
+      .limit(1);
+    await db.delete(quotations).where(eq(quotations.id, id));
+    await deleteStoredPdf({ url: existing?.pdfUrl, key: existing?.pdfKey });
+    revalidatePath("/quotations");
+    return { success: true, message: "Cotización eliminada" };
+  } catch (error) {
+    console.error("Error al eliminar cotización:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function updateQuotationStatus(
+  id: string,
+  status: string
+): Promise<ActionResult> {
+  const denied = await denyUnless("quotations:write");
+  if (denied) return denied;
+  try {
+    await db.update(quotations).set({ status }).where(eq(quotations.id, id));
+    revalidatePath("/quotations");
+    return { success: true, message: "Estado actualizado" };
+  } catch (error) {
+    console.error("Error al actualizar estado:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+// ==========================================
+// PORTAL DEL CLIENTE
+// ==========================================
+
+export type PortalQuotation = Pick<
+  Quotation,
+  "id" | "quotationNumber" | "issueDate" | "validUntil" | "status" | "total"
+>;
+
+export async function getQuotationsByCostCenter(
+  costCenterId: string
+): Promise<PortalQuotation[]> {
+  await requirePermission("quotations:read");
+  try {
+    const rows = await db
+      .select({
+        id: quotations.id,
+        quotationNumber: quotations.quotationNumber,
+        issueDate: quotations.issueDate,
+        validUntil: quotations.validUntil,
+        status: quotations.status,
+        total: quotations.total,
+      })
+      .from(quotations)
+      .where(eq(quotations.costCenterId, costCenterId))
+      .orderBy(desc(quotations.createdAt));
+    return rows;
+  } catch (error) {
+    console.error("Error al obtener cotizaciones del portal:", error);
+    return [];
+  }
+}

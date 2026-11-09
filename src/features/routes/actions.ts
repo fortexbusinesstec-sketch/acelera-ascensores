@@ -1,0 +1,1531 @@
+﻿"use server";
+
+import { revalidatePath } from "next/cache";
+import {
+  db,
+  users,
+  roles,
+  staffProfiles,
+  preventiveRoutes,
+  preventiveRouteStops,
+  preventiveRouteConfig,
+  contracts,
+  serviceTypes,
+  contractElevators,
+  elevatorUnities,
+  costCenters,
+  clients,
+  workOrders,
+  workOrderElevators,
+} from "@/db/index";
+import { getErrorMessage } from "@/lib/errors";
+import { generateUuid } from "@/lib/uuid";
+import { uniqueDocumentNumber } from "@/lib/document-number";
+import { routeStopFormSchema, routeConfigSchema, type RouteStopFormValues } from "./schema";
+import { groupStopsByVisit, isContractInactive, visitKeyOfStop } from "./visits";
+import {
+  ROUTE_DEFAULTS,
+  PREVENTIVE_SERVICE_TYPE_ID,
+  buildMonthSchedule,
+  isValidMonth,
+  nextMonthLabel,
+  resolveDayCapacity,
+  type RouteConfigValues,
+} from "./schedule";
+import { type BatchItem } from "drizzle-orm/batch";
+import {
+  and,
+  asc,
+  count,
+  countDistinct,
+  eq,
+  inArray,
+  isNull,
+  like,
+  max,
+  ne,
+  notInArray,
+  or,
+} from "drizzle-orm";
+import { getSessionUserId } from "@/features/auth/server";
+import {
+  buildPreventiveElevatorDetail,
+  type PreventiveElevatorDetail,
+} from "@/features/work-orders/actions";
+import { denyUnless, requirePermission } from "@/features/auth/guard";
+
+// ==========================================
+// 1. TÉCNICOS
+// ==========================================
+
+export type TechnicianOption = {
+  id: string;
+  fullName: string;
+  specialization: string | null;
+  providerType: string | null;
+  providerCompany: string | null;
+};
+
+export async function getTechnicians(): Promise<TechnicianOption[]> {
+  await requirePermission("routes:read");
+  try {
+    return await db
+      .select({
+        id: users.id,
+        fullName: users.fullName,
+        specialization: staffProfiles.specialization,
+        providerType: staffProfiles.providerType,
+        providerCompany: staffProfiles.providerCompany,
+      })
+      .from(users)
+      .innerJoin(roles, eq(users.roleId, roles.id))
+      .leftJoin(staffProfiles, eq(staffProfiles.userId, users.id))
+      .where(
+        and(
+          isNull(users.deletedAt),
+          eq(users.status, "ACTIVE"),
+          like(roles.name, "%TECNICO%")
+        )
+      )
+      .orderBy(asc(users.fullName));
+  } catch (error) {
+    console.error("Error al obtener técnicos:", error);
+    return [];
+  }
+}
+
+// ==========================================
+// 2. RUTAS PREVENTIVAS (TABLERO)
+// ==========================================
+
+export type RouteStopWithRelations = {
+  id: string;
+  routeId: string;
+  visitGroupId: string | null;
+  contractElevatorId: string;
+  plannedTime: string;
+  orderIndex: number;
+  estimatedDurationMins: number;
+  generatedWorkOrderId: string | null;
+  generatedMonth: string | null;
+  generatedAt: number | null;
+  elevatorUnityId: string;
+  internalCode: string;
+  elevatorName: string;
+  costCenterId: string;
+  costCenterName: string;
+  clientName: string;
+  contractId: string;
+  contractNumber: string;
+  contractStatus: string | null;
+  contractDeletedAt: number | null;
+  frequencyMonths: number;
+  contractStartDate: number;
+};
+
+export type PreventiveRouteWithStops = {
+  id: string;
+  technicianId: string;
+  businessDayNumber: number;
+  name: string | null;
+  stops: RouteStopWithRelations[];
+};
+
+export async function getPreventiveRoutes(
+  technicianId: string
+): Promise<PreventiveRouteWithStops[]> {
+  await requirePermission("routes:read");
+  try {
+    const [routeRows, stopRows] = await Promise.all([
+      db
+        .select()
+        .from(preventiveRoutes)
+        .where(
+          and(
+            eq(preventiveRoutes.technicianId, technicianId),
+            eq(preventiveRoutes.isActive, true)
+          )
+        )
+        .orderBy(asc(preventiveRoutes.businessDayNumber)),
+      db
+        .select({
+          id: preventiveRouteStops.id,
+          routeId: preventiveRouteStops.routeId,
+          contractElevatorId: preventiveRouteStops.contractElevatorId,
+          visitGroupId: preventiveRouteStops.visitGroupId,
+          plannedTime: preventiveRouteStops.plannedTime,
+          orderIndex: preventiveRouteStops.orderIndex,
+          estimatedDurationMins: preventiveRouteStops.estimatedDurationMins,
+          generatedWorkOrderId: preventiveRouteStops.generatedWorkOrderId,
+          generatedMonth: preventiveRouteStops.generatedMonth,
+          generatedAt: preventiveRouteStops.generatedAt,
+          elevatorUnityId: elevatorUnities.id,
+          internalCode: elevatorUnities.internalCode,
+          elevatorName: elevatorUnities.name,
+          costCenterId: costCenters.id,
+          costCenterName: costCenters.name,
+          clientName: clients.legalName,
+          contractId: contracts.id,
+          contractNumber: contracts.contractNumber,
+          contractStatus: contracts.status,
+           contractDeletedAt: contracts.deletedAt,
+           frequencyMonths: contractElevators.frequencyMonths,
+           contractStartDate: contracts.startDate,
+        })
+        .from(preventiveRouteStops)
+        .innerJoin(preventiveRoutes, eq(preventiveRouteStops.routeId, preventiveRoutes.id))
+        .innerJoin(contractElevators, eq(preventiveRouteStops.contractElevatorId, contractElevators.id))
+        .innerJoin(contracts, eq(contractElevators.contractId, contracts.id))
+        .innerJoin(elevatorUnities, eq(contractElevators.elevatorUnityId, elevatorUnities.id))
+        .innerJoin(costCenters, eq(elevatorUnities.costCenterId, costCenters.id))
+        .innerJoin(clients, eq(costCenters.clientId, clients.id))
+        .where(eq(preventiveRoutes.technicianId, technicianId))
+        .orderBy(asc(preventiveRouteStops.plannedTime), asc(preventiveRouteStops.orderIndex)),
+    ]);
+
+    const stopsByRoute = new Map<string, RouteStopWithRelations[]>();
+    for (const s of stopRows) {
+      const list = stopsByRoute.get(s.routeId) ?? [];
+      list.push({
+        id: s.id,
+        routeId: s.routeId,
+        contractElevatorId: s.contractElevatorId,
+        visitGroupId: s.visitGroupId,
+        plannedTime: s.plannedTime,
+        orderIndex: s.orderIndex ?? 0,
+        estimatedDurationMins: s.estimatedDurationMins ?? ROUTE_DEFAULTS.defaultStopDurationMins,
+        generatedWorkOrderId: s.generatedWorkOrderId,
+        generatedMonth: s.generatedMonth,
+        generatedAt: s.generatedAt,
+        elevatorUnityId: s.elevatorUnityId,
+        internalCode: s.internalCode,
+        elevatorName: s.elevatorName,
+        costCenterId: s.costCenterId,
+        costCenterName: s.costCenterName,
+        clientName: s.clientName,
+        contractId: s.contractId,
+        contractNumber: s.contractNumber,
+        contractStatus: s.contractStatus,
+         contractDeletedAt: s.contractDeletedAt,
+         frequencyMonths: s.frequencyMonths ?? 1,
+         contractStartDate: s.contractStartDate,
+      });
+      stopsByRoute.set(s.routeId, list);
+    }
+
+    return routeRows.map((r) => ({
+      id: r.id,
+      technicianId: r.technicianId,
+      businessDayNumber: r.businessDayNumber,
+      name: r.name,
+      stops: stopsByRoute.get(r.id) ?? [],
+    }));
+  } catch (error) {
+    console.error("Error al obtener rutas preventivas:", error);
+    return [];
+  }
+}
+
+// ==========================================
+// 3. CONTRATOS PREVENTIVOS PARA EL FORMULARIO
+// ==========================================
+
+/** Un contrato solo entra al tablero de rutas si es preventivo. */
+function isPreventiveContractFilter() {
+  return or(
+    eq(serviceTypes.code, "PREV"),
+    eq(contracts.serviceTypeId, PREVENTIVE_SERVICE_TYPE_ID)
+  );
+}
+
+export type PreventiveContractOption = {
+  id: string;
+  contractNumber: string;
+  costCenterId: string;
+  costCenterName: string;
+  clientName: string;
+  equipment: Array<{
+    id: string;
+    elevatorUnityId: string;
+    internalCode: string;
+    name: string;
+  }>;
+};
+
+export async function getPreventiveContractOptions(): Promise<PreventiveContractOption[]> {
+  await requirePermission("routes:read");
+  try {
+    const contractRows = await db
+      .select({
+        id: contracts.id,
+        contractNumber: contracts.contractNumber,
+        costCenterId: costCenters.id,
+        costCenterName: costCenters.name,
+        clientName: clients.legalName,
+      })
+      .from(contracts)
+      .innerJoin(serviceTypes, eq(contracts.serviceTypeId, serviceTypes.id))
+      .innerJoin(costCenters, eq(contracts.costCenterId, costCenters.id))
+      .innerJoin(clients, eq(costCenters.clientId, clients.id))
+      .where(
+        and(
+          eq(contracts.status, "ACTIVE"),
+          isPreventiveContractFilter(),
+          isNull(contracts.deletedAt),
+          isNull(costCenters.deletedAt)
+        )
+      )
+      .orderBy(asc(costCenters.name), asc(contracts.contractNumber));
+
+    if (contractRows.length === 0) return [];
+
+    const contractIds = contractRows.map((c) => c.id);
+    const equipmentRows = await db
+      .select({
+        id: contractElevators.id,
+        contractId: contractElevators.contractId,
+        elevatorUnityId: elevatorUnities.id,
+        internalCode: elevatorUnities.internalCode,
+        name: elevatorUnities.name,
+      })
+      .from(contractElevators)
+      .innerJoin(elevatorUnities, eq(contractElevators.elevatorUnityId, elevatorUnities.id))
+      .where(
+        and(
+          inArray(contractElevators.contractId, contractIds),
+          isNull(elevatorUnities.deletedAt)
+        )
+      )
+      .orderBy(asc(elevatorUnities.internalCode));
+
+    const equipmentByContract = new Map<string, PreventiveContractOption["equipment"]>();
+    const equipmentIds = equipmentRows.map((e) => e.id);
+    const scheduledIds =
+      equipmentIds.length === 0
+        ? new Set<string>()
+        : new Set(
+            (
+              await db
+                .select({ contractElevatorId: preventiveRouteStops.contractElevatorId })
+                .from(preventiveRouteStops)
+                .where(inArray(preventiveRouteStops.contractElevatorId, equipmentIds))
+            ).map((r) => r.contractElevatorId)
+          );
+
+    for (const e of equipmentRows) {
+      // Un equipo ya programado en cualquier día no se vuelve a ofrecer.
+      if (scheduledIds.has(e.id)) continue;
+      const list = equipmentByContract.get(e.contractId) ?? [];
+      list.push({
+        id: e.id,
+        elevatorUnityId: e.elevatorUnityId,
+        internalCode: e.internalCode,
+        name: e.name,
+      });
+      equipmentByContract.set(e.contractId, list);
+    }
+
+    // Solo se ofrecen contratos que todavía tienen algún equipo sin programar.
+    return contractRows
+      .map((c) => ({
+        ...c,
+        equipment: equipmentByContract.get(c.id) ?? [],
+      }))
+      .filter((c) => c.equipment.length > 0);
+  } catch (error) {
+    console.error("Error al obtener contratos preventivos:", error);
+    return [];
+  }
+}
+
+// ==========================================
+// 3.2 COBERTURA DE CONTRATOS PREVENTIVOS
+// ==========================================
+
+export type PreventiveContractCoverageEntry = {
+  contractId: string;
+  contractNumber: string;
+  costCenterId: string;
+  costCenterName: string;
+  clientId: string;
+  clientName: string;
+  totalEquipment: number;
+  scheduledEquipment: number;
+  /** Visitas (días hábiles) donde ya está enlazado. */
+  scheduledDays: number;
+};
+
+export type PreventiveContractCoverage = {
+  totalContracts: number;
+  totalEquipment: number;
+  scheduledContracts: number;
+  scheduledEquipment: number;
+  /** Contratos sin ninguna parada en el tablero. */
+  pendingContracts: number;
+  /** Contratos pendientes que además no tienen equipos vincular. */
+  pendingWithoutEquipment: number;
+  entries: PreventiveContractCoverageEntry[];
+  pending: PreventiveContractCoverageEntry[];
+};
+
+/**
+ * Compara los contratos PREV activos contra las paradas ya programadas en
+ * cualquier ruta, para saber qué clientes/contratos falta enlazar al tablero.
+ */
+export async function getPreventiveContractCoverage(): Promise<PreventiveContractCoverage> {
+  await requirePermission("routes:read");
+  const empty: PreventiveContractCoverage = {
+    totalContracts: 0,
+    totalEquipment: 0,
+    scheduledContracts: 0,
+    scheduledEquipment: 0,
+    pendingContracts: 0,
+    pendingWithoutEquipment: 0,
+    entries: [],
+    pending: [],
+  };
+
+  try {
+    const prevRows = await db
+      .select({
+        contractId: contracts.id,
+        contractNumber: contracts.contractNumber,
+        status: contracts.status,
+        costCenterId: costCenters.id,
+        costCenterName: costCenters.name,
+        clientId: clients.id,
+        clientName: clients.legalName,
+        totalEquipment: count(contractElevators.id),
+      })
+      .from(contracts)
+      .innerJoin(serviceTypes, eq(contracts.serviceTypeId, serviceTypes.id))
+      .innerJoin(costCenters, eq(contracts.costCenterId, costCenters.id))
+      .innerJoin(clients, eq(costCenters.clientId, clients.id))
+      .leftJoin(contractElevators, eq(contractElevators.contractId, contracts.id))
+      .where(
+        and(
+          eq(contracts.status, "ACTIVE"),
+          isPreventiveContractFilter(),
+          isNull(contracts.deletedAt),
+          isNull(costCenters.deletedAt)
+        )
+      )
+      .groupBy(
+        contracts.id,
+        contracts.contractNumber,
+        contracts.status,
+        costCenters.id,
+        costCenters.name,
+        clients.id,
+        clients.legalName
+      )
+      .orderBy(asc(clients.legalName), asc(costCenters.name), asc(contracts.contractNumber));
+
+    if (prevRows.length === 0) return empty;
+
+    const contractIds = prevRows.map((r) => r.contractId);
+    const linkedRows = await db
+      .select({
+        contractId: contractElevators.contractId,
+        scheduledEquipment: countDistinct(preventiveRouteStops.id),
+        scheduledDays: countDistinct(preventiveRouteStops.routeId),
+      })
+      .from(contractElevators)
+      .innerJoin(
+        preventiveRouteStops,
+        eq(preventiveRouteStops.contractElevatorId, contractElevators.id)
+      )
+      .where(inArray(contractElevators.contractId, contractIds))
+      .groupBy(contractElevators.contractId);
+
+    const linkedByContract = new Map(linkedRows.map((r) => [r.contractId, r]));
+
+    const entries: PreventiveContractCoverageEntry[] = prevRows.map((r) => {
+      const linked = linkedByContract.get(r.contractId);
+      return {
+        contractId: r.contractId,
+        contractNumber: r.contractNumber,
+        costCenterId: r.costCenterId,
+        costCenterName: r.costCenterName,
+        clientId: r.clientId,
+        clientName: r.clientName,
+        totalEquipment: r.totalEquipment,
+        scheduledEquipment: linked?.scheduledEquipment ?? 0,
+        scheduledDays: linked?.scheduledDays ?? 0,
+      };
+    });
+
+    const pending = entries.filter((e) => e.scheduledEquipment === 0);
+
+    return {
+      totalContracts: entries.length,
+      totalEquipment: entries.reduce((acc, e) => acc + e.totalEquipment, 0),
+      scheduledContracts: entries.length - pending.length,
+      scheduledEquipment: entries.reduce((acc, e) => acc + e.scheduledEquipment, 0),
+      pendingContracts: pending.length,
+      pendingWithoutEquipment: pending.filter((e) => e.totalEquipment === 0).length,
+      entries,
+      pending,
+    };
+  } catch (error) {
+    console.error("Error al obtener cobertura de contratos preventivos:", error);
+    return empty;
+  }
+}
+
+// ==========================================
+// 3.1 CONFIGURACIÓN POR TÉCNICO
+// ==========================================
+
+export type RouteConfigRow = RouteConfigValues & {
+  updatedAt: number | null;
+  canEditMaxDays: boolean;
+};
+
+async function isAdminUser(): Promise<boolean> {
+  try {
+    const sessionUserId = await getSessionUserId();
+    if (!sessionUserId) return false;
+    const [row] = await db
+      .select({ roleName: roles.name })
+      .from(users)
+      .innerJoin(roles, eq(users.roleId, roles.id))
+      .where(eq(users.id, sessionUserId))
+      .limit(1);
+    return (row?.roleName ?? "").toUpperCase().includes("ADMIN");
+  } catch {
+    return false;
+  }
+}
+
+export async function getRouteConfig(technicianId: string): Promise<RouteConfigRow> {
+  await requirePermission("routes:read");
+  const canEditMaxDays = await isAdminUser();
+  if (!technicianId) {
+    return {
+      technicianId: "",
+      ...ROUTE_DEFAULTS,
+      updatedAt: null,
+      canEditMaxDays,
+    };
+  }
+  try {
+    const rows = await db
+      .select()
+      .from(preventiveRouteConfig)
+      .where(eq(preventiveRouteConfig.technicianId, technicianId))
+      .limit(1);
+    const row = rows[0];
+    if (!row) {
+      return {
+        technicianId,
+        totalDays: ROUTE_DEFAULTS.totalDays,
+        maxDays: ROUTE_DEFAULTS.maxDays,
+        includeSaturdays: ROUTE_DEFAULTS.includeSaturdays,
+        saturdayMaxHours: ROUTE_DEFAULTS.saturdayMaxHours,
+        defaultStopDurationMins: ROUTE_DEFAULTS.defaultStopDurationMins,
+        updatedAt: null,
+        canEditMaxDays,
+      };
+    }
+    return {
+      technicianId: row.technicianId,
+      totalDays: row.totalDays ?? ROUTE_DEFAULTS.totalDays,
+      maxDays: row.maxDays ?? ROUTE_DEFAULTS.maxDays,
+      includeSaturdays: row.includeSaturdays ?? ROUTE_DEFAULTS.includeSaturdays,
+      saturdayMaxHours: row.saturdayMaxHours ?? ROUTE_DEFAULTS.saturdayMaxHours,
+      defaultStopDurationMins:
+        row.defaultStopDurationMins ?? ROUTE_DEFAULTS.defaultStopDurationMins,
+      updatedAt: row.updatedAt ?? null,
+      canEditMaxDays,
+    };
+  } catch (error) {
+    console.error("Error al obtener configuración de ruta:", error);
+    return {
+      technicianId,
+      ...ROUTE_DEFAULTS,
+      updatedAt: null,
+      canEditMaxDays,
+    };
+  }
+}
+
+export async function updateRouteConfig(technicianId: string, input: unknown) {
+  const denied = await denyUnless("routes:write");
+  if (denied) return denied;
+  try {
+    if (!technicianId) return { success: false, error: "Selecciona un técnico." };
+    const parsed = routeConfigSchema.safeParse(input);
+    if (!parsed.success) {
+      return { success: false, error: parsed.error.issues[0]?.message ?? "Datos inválidos" };
+    }
+    const canEditMaxDays = await isAdminUser();
+    if (parsed.data.maxDays !== undefined && !canEditMaxDays) {
+      return { success: false, error: "Solo un administrador puede modificar el máximo de días." };
+    }
+
+    const current = await getRouteConfig(technicianId);
+    const maxDays = parsed.data.maxDays ?? current.maxDays;
+    if (parsed.data.totalDays > maxDays) {
+      return {
+        success: false,
+        error: `El total de días (${parsed.data.totalDays}) no puede superar el máximo permitido (${maxDays}).`,
+      };
+    }
+
+    const values = {
+      technicianId,
+      totalDays: parsed.data.totalDays,
+      maxDays,
+      includeSaturdays: parsed.data.includeSaturdays,
+      saturdayMaxHours: parsed.data.saturdayMaxHours,
+      defaultStopDurationMins: parsed.data.defaultStopDurationMins,
+      updatedAt: Math.floor(Date.now() / 1000),
+    };
+
+    const existing = await db
+      .select({ id: preventiveRouteConfig.technicianId })
+      .from(preventiveRouteConfig)
+      .where(eq(preventiveRouteConfig.technicianId, technicianId))
+      .limit(1);
+
+    if (existing.length > 0) {
+      await db
+        .update(preventiveRouteConfig)
+        .set(values)
+        .where(eq(preventiveRouteConfig.technicianId, technicianId));
+    } else {
+      await db.insert(preventiveRouteConfig).values(values);
+    }
+
+    revalidatePath("/routes");
+    return { success: true, message: "Configuración de ruta actualizada" };
+  } catch (error) {
+    console.error("Error al actualizar configuración de ruta:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function resetRouteConfig(technicianId: string) {
+  const denied = await denyUnless("routes:write");
+  if (denied) return denied;
+  try {
+    if (!technicianId) return { success: false, error: "Selecciona un técnico." };
+    const values = {
+      technicianId,
+      ...ROUTE_DEFAULTS,
+      updatedAt: Math.floor(Date.now() / 1000),
+    };
+    const existing = await db
+      .select({ id: preventiveRouteConfig.technicianId })
+      .from(preventiveRouteConfig)
+      .where(eq(preventiveRouteConfig.technicianId, technicianId))
+      .limit(1);
+    if (existing.length > 0) {
+      await db
+        .update(preventiveRouteConfig)
+        .set(values)
+        .where(eq(preventiveRouteConfig.technicianId, technicianId));
+    } else {
+      await db.insert(preventiveRouteConfig).values(values);
+    }
+    revalidatePath("/routes");
+    return { success: true, message: "Configuración restablecida a valores por defecto" };
+  } catch (error) {
+    console.error("Error al restablecer configuración de ruta:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+// ==========================================
+// 4. CRUD DE PARADAS
+// ==========================================
+
+async function ensureRoute(technicianId: string, businessDayNumber: number): Promise<string> {
+  const existing = await db
+    .select({ id: preventiveRoutes.id })
+    .from(preventiveRoutes)
+    .where(
+      and(
+        eq(preventiveRoutes.technicianId, technicianId),
+        eq(preventiveRoutes.businessDayNumber, businessDayNumber)
+      )
+    )
+    .limit(1);
+
+  if (existing.length > 0) return existing[0].id;
+
+  const id = generateUuid();
+  await db.insert(preventiveRoutes).values({
+    id,
+    technicianId,
+    businessDayNumber,
+    name: `Ruta - Día ${businessDayNumber}`,
+  });
+  return id;
+}
+
+export type DayLoad = {
+  stops: number;
+  visits: number;
+  minutes: number;
+  maxMinutes: number;
+  isSaturday: boolean;
+  date: string | null;
+};
+
+export async function getDayLoads(
+  technicianId: string,
+  config: RouteConfigValues,
+  referenceMonth = nextMonthLabel()
+): Promise<Map<number, DayLoad>> {
+  await requirePermission("routes:read");
+  const routes = await getPreventiveRoutes(technicianId);
+  const loads = new Map<number, DayLoad>();
+  for (let day = 1; day <= config.totalDays; day++) {
+    const capacity = resolveDayCapacity(referenceMonth, day, config);
+    loads.set(day, {
+      stops: 0,
+      visits: 0,
+      minutes: 0,
+      maxMinutes: capacity.maxMinutes,
+      isSaturday: capacity.isSaturday,
+      date: capacity.date,
+    });
+  }
+  for (const route of routes) {
+    if (route.businessDayNumber < 1 || route.businessDayNumber > config.totalDays) continue;
+    const entry = loads.get(route.businessDayNumber);
+    if (!entry) continue;
+    entry.stops += route.stops.length;
+    // La carga se cuenta por visita (grupo), no por equipo.
+    for (const group of groupStopsByVisit(route.stops)) {
+      entry.visits += 1;
+      entry.minutes += group[0]?.estimatedDurationMins ?? ROUTE_DEFAULTS.defaultStopDurationMins;
+    }
+  }
+  return loads;
+}
+
+function assertDayCapacity(load: DayLoad, addedMinutes: number): string | null {
+  if (addedMinutes <= 0) return null;
+  const effective = load.minutes + addedMinutes;
+  if (effective > load.maxMinutes) {
+    const maxHours = (load.maxMinutes / 60).toLocaleString("es-PE");
+    return `El día supera el máximo de ${maxHours}h${
+      load.isSaturday ? " (sábado)" : ""
+    }. Actual: ${(load.minutes / 60).toFixed(1)}h + ${(addedMinutes / 60).toFixed(1)}h.`;
+  }
+  return null;
+}
+
+async function validateCapacityForCreate(
+  technicianId: string,
+  businessDayNumber: number,
+  addedMinutes: number
+): Promise<string | null> {
+  const config = await getRouteConfig(technicianId);
+  if (businessDayNumber > config.totalDays) {
+    return `El Día ${businessDayNumber} está fuera del rango configurado (1-${config.totalDays}).`;
+  }
+  const loads = await getDayLoads(technicianId, config);
+  const load = loads.get(businessDayNumber);
+  if (!load) return `El Día ${businessDayNumber} no existe en la configuración.`;
+  return assertDayCapacity(load, addedMinutes);
+}
+
+async function validateCapacityForMove(
+  technicianId: string,
+  businessDayNumber: number,
+  stopIds: string[]
+): Promise<string | null> {
+  const config = await getRouteConfig(technicianId);
+  if (businessDayNumber > config.totalDays) {
+    return `El Día ${businessDayNumber} está fuera del rango configurado (1-${config.totalDays}).`;
+  }
+
+  const routes = await getPreventiveRoutes(technicianId);
+  const targetRouteId = routes.find((r) => r.businessDayNumber === businessDayNumber)?.id ?? null;
+
+  const movingRows = await db
+    .select({
+      id: preventiveRouteStops.id,
+      routeId: preventiveRouteStops.routeId,
+      estimatedDurationMins: preventiveRouteStops.estimatedDurationMins,
+    })
+    .from(preventiveRouteStops)
+    .where(inArray(preventiveRouteStops.id, stopIds));
+
+  // Los stops que ya están en el día destino no suman carga adicional.
+  const netAdded = movingRows.reduce(
+    (acc, row) =>
+      row.routeId === targetRouteId
+        ? acc
+        : acc + (row.estimatedDurationMins || ROUTE_DEFAULTS.defaultStopDurationMins),
+    0
+  );
+
+  const loads = await getDayLoads(technicianId, config);
+  const load = loads.get(businessDayNumber);
+  if (!load) return `El Día ${businessDayNumber} no existe en la configuración.`;
+  return assertDayCapacity(load, netAdded);
+}
+
+export async function createRouteStops(data: RouteStopFormValues) {
+  const denied = await denyUnless("routes:write");
+  if (denied) return denied;
+  try {
+    const validated = routeStopFormSchema.parse(data);
+    const config = await getRouteConfig(validated.technicianId);
+    if (validated.businessDayNumber > config.totalDays) {
+      return {
+        success: false,
+        error: `El Día ${validated.businessDayNumber} está fuera del rango configurado (1-${config.totalDays}).`,
+      };
+    }
+
+    // Solo contratos PREV admiten paradas en el tablero de rutas preventivas.
+    const [preventiveContract] = await db
+      .select({ id: contracts.id })
+      .from(contracts)
+      .innerJoin(serviceTypes, eq(contracts.serviceTypeId, serviceTypes.id))
+      .where(and(eq(contracts.id, validated.contractId), isPreventiveContractFilter()))
+      .limit(1);
+    if (!preventiveContract) {
+      return {
+        success: false,
+        error: "El contrato seleccionado no es de tipo preventivo (PREV).",
+      };
+    }
+
+    // Resuelve los equipos del contrato a sus paradas (contract_elevator).
+    const equipment = await db
+      .select({ id: contractElevators.id, elevatorUnityId: contractElevators.elevatorUnityId })
+      .from(contractElevators)
+      .innerJoin(elevatorUnities, eq(contractElevators.elevatorUnityId, elevatorUnities.id))
+      .where(
+        and(
+          eq(contractElevators.contractId, validated.contractId),
+          inArray(contractElevators.elevatorUnityId, validated.elevatorUnityIds),
+          isNull(elevatorUnities.deletedAt)
+        )
+      );
+    if (equipment.length !== validated.elevatorUnityIds.length) {
+      return {
+        success: false,
+        error: "Uno o más equipos no pertenecen al contrato seleccionado.",
+      };
+    }
+
+    // Cada visita (grupo) suma su duración estimada una sola vez.
+    const capacityError = await validateCapacityForCreate(
+      validated.technicianId,
+      validated.businessDayNumber,
+      validated.estimatedDurationMins
+    );
+    if (capacityError) return { success: false, error: capacityError };
+
+    const routeId = await ensureRoute(validated.technicianId, validated.businessDayNumber);
+    const visitGroupId = generateUuid();
+
+    const [{ total }] = await db
+      .select({ total: count() })
+      .from(preventiveRouteStops)
+      .where(eq(preventiveRouteStops.routeId, routeId));
+
+    const stmts: BatchItem<"sqlite">[] = [];
+    equipment.forEach((eqRow, idx) => {
+      stmts.push(
+        db.insert(preventiveRouteStops).values({
+          id: generateUuid(),
+          routeId,
+          visitGroupId,
+          contractElevatorId: eqRow.id,
+          plannedTime: validated.plannedTime,
+          estimatedDurationMins: validated.estimatedDurationMins,
+          orderIndex: total + idx + 1,
+        })
+      );
+    });
+
+    await db.batch(
+      stmts as unknown as Parameters<typeof db.batch>[0]
+    );
+    revalidatePath("/routes");
+    return {
+      success: true,
+      message: `Visita con ${stmts.length} ${stmts.length === 1 ? "equipo" : "equipos"} agregada al Día ${validated.businessDayNumber}`,
+    };
+  } catch (error) {
+    console.error("Error al crear paradas de ruta:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function updateRouteStopDuration(ids: string[], estimatedDurationMins: number) {
+  const denied = await denyUnless("routes:write");
+  if (denied) return denied;
+  try {
+    if (!ids.length) return { success: false, error: "No hay paradas seleccionadas." };
+    const mins = Math.trunc(estimatedDurationMins);
+    if (!Number.isFinite(mins) || mins < 15 || mins > 600) {
+      return { success: false, error: "Duración inválida (entre 15 y 600 minutos)." };
+    }
+    await db
+      .update(preventiveRouteStops)
+      .set({ estimatedDurationMins: mins })
+      .where(inArray(preventiveRouteStops.id, ids));
+    revalidatePath("/routes");
+    return { success: true, message: "Duración actualizada" };
+  } catch (error) {
+    console.error("Error al actualizar duración de paradas:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function updateRouteStopsTime(ids: string[], plannedTime: string) {
+  const denied = await denyUnless("routes:write");
+  if (denied) return denied;
+  try {
+    if (!ids.length) return { success: false, error: "No hay paradas seleccionadas." };
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(plannedTime)) {
+      return { success: false, error: "Hora inválida (formato HH:MM)." };
+    }
+    await db
+      .update(preventiveRouteStops)
+      .set({ plannedTime })
+      .where(inArray(preventiveRouteStops.id, ids));
+    revalidatePath("/routes");
+    return { success: true, message: "Hora actualizada" };
+  } catch (error) {
+    console.error("Error al actualizar hora de paradas:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function moveRouteStops(
+  ids: string[],
+  technicianId: string,
+  businessDayNumber: number
+) {
+  const denied = await denyUnless("routes:write");
+  if (denied) return denied;
+  try {
+    if (!ids.length) return { success: false, error: "No hay paradas seleccionadas." };
+    if (!Number.isInteger(businessDayNumber) || businessDayNumber < 1) {
+      return { success: false, error: "Día hábil inválido." };
+    }
+    const capacityError = await validateCapacityForMove(
+      technicianId,
+      businessDayNumber,
+      ids
+    );
+    if (capacityError) return { success: false, error: capacityError };
+    const routeId = await ensureRoute(technicianId, businessDayNumber);
+
+    const [{ maxIndex }] = await db
+      .select({ maxIndex: max(preventiveRouteStops.orderIndex) })
+      .from(preventiveRouteStops)
+      .where(eq(preventiveRouteStops.routeId, routeId));
+
+    let seq = (maxIndex ?? 0) + 1;
+    for (const id of ids) {
+      await db
+        .update(preventiveRouteStops)
+        .set({ routeId, orderIndex: seq++ })
+        .where(eq(preventiveRouteStops.id, id));
+    }
+
+    revalidatePath("/routes");
+    return { success: true, message: "Paradas movidas al Día " + businessDayNumber };
+  } catch (error) {
+    console.error("Error al mover paradas:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function deleteRouteStops(ids: string[]) {
+  const denied = await denyUnless("routes:write");
+  if (denied) return denied;
+  try {
+    if (!ids.length) return { success: false, error: "No hay paradas seleccionadas." };
+    await db.delete(preventiveRouteStops).where(inArray(preventiveRouteStops.id, ids));
+    revalidatePath("/routes");
+    return { success: true, message: "Paradas eliminadas de la ruta" };
+  } catch (error) {
+    console.error("Error al eliminar paradas:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+// ==========================================
+// 5. GENERACIÓN MENSUAL DE OTs PREVENTIVAS
+// ==========================================
+
+export type GenerationError = {
+  stopId: string;
+  visitGroupId: string | null;
+  businessDayNumber: number;
+  costCenterName: string;
+  equipmentCount: number;
+  message: string;
+};
+
+export type GenerationResult = {
+  success: boolean;
+  month: string;
+  created: number;
+  skipped: number;
+  errors: GenerationError[];
+  error?: string;
+};
+
+function isContractFrequencyDue(
+  contractStartDate: number,
+  frequencyMonths: number,
+  scheduledDate: string
+): boolean {
+  const [year, month, day] = scheduledDate.split("-").map(Number);
+  const start = new Date(contractStartDate * 1000);
+  const target = new Date(Date.UTC(year, month - 1, day || 1));
+  const monthsSinceStart =
+    (target.getUTCFullYear() - start.getUTCFullYear()) * 12 +
+    target.getUTCMonth() - start.getUTCMonth();
+  const frequency = Math.max(1, frequencyMonths || 1);
+  return monthsSinceStart >= 0 && monthsSinceStart % frequency === 0;
+}
+
+export async function generateMonth(
+  technicianId: string,
+  month: string = nextMonthLabel()
+): Promise<GenerationResult> {
+  const denied = await denyUnless("routes:write");
+  if (denied) {
+    return { success: false, month, created: 0, skipped: 0, errors: [], error: denied.error };
+  }
+  const empty: GenerationResult = {
+    success: false,
+    month,
+    created: 0,
+    skipped: 0,
+    errors: [],
+  };
+  try {
+    if (!technicianId) return { ...empty, error: "Selecciona un técnico." };
+    if (!isValidMonth(month)) {
+      return { ...empty, error: "Mes inválido (formato YYYY-MM)." };
+    }
+
+    const config = await getRouteConfig(technicianId);
+
+    const prevRows = await db
+      .select({ id: serviceTypes.id })
+      .from(serviceTypes)
+      .where(eq(serviceTypes.code, "PREV"))
+      .limit(1);
+    const prevServiceTypeId = prevRows[0]?.id;
+    if (!prevServiceTypeId) {
+      return { ...empty, error: "No existe el tipo de servicio PREV registrado." };
+    }
+
+    const schedule = buildMonthSchedule(month, config.totalDays, config.includeSaturdays);
+    if (schedule.size === 0) {
+      return { ...empty, error: "No se pudieron calcular los días hábiles del mes." };
+    }
+
+    const routes = await getPreventiveRoutes(technicianId);
+    const errors: GenerationError[] = [];
+    const pendingGroups: Array<{
+      key: string;
+      stops: RouteStopWithRelations[];
+      day: number;
+      date: string;
+    }> = [];
+    let skipped = 0;
+
+    for (const route of routes) {
+      if (route.businessDayNumber > config.totalDays) continue;
+      const date = schedule.get(route.businessDayNumber);
+      if (!date) continue;
+
+      for (const group of groupStopsByVisit(route.stops)) {
+        const first = group[0];
+        const key = visitKeyOfStop(first);
+
+        // La visita ya está completa para este mes (todos sus equipos en la misma OT) -> se omite.
+        const generatedOts = new Set(
+          group
+            .filter((s) => s.generatedMonth === month)
+            .map((s) => s.generatedWorkOrderId)
+        );
+        if (
+          group.every((s) => s.generatedMonth === month) &&
+          generatedOts.size === 1 &&
+          !generatedOts.has(null)
+        ) {
+          skipped += group.length;
+          continue;
+        }
+
+        const dueStops = group.filter((stop) =>
+          isContractFrequencyDue(stop.contractStartDate, stop.frequencyMonths, date)
+        );
+        if (dueStops.length === 0) {
+          skipped += group.length;
+          continue;
+        }
+
+        // Una sola OT preventiva por equipo y mes, sin importar el día elegido.
+        // Se excluyen las OTs generadas por esta misma visita, que se liberan y
+        // regeneran al mover la parada de fecha dentro del mes.
+        const ownGeneratedIds = [
+          ...new Set(
+            group
+              .filter((stop) => stop.generatedMonth === month)
+              .map((stop) => stop.generatedWorkOrderId)
+              .filter((id): id is string => id !== null)
+          ),
+        ];
+        const existingElevators = await db
+          .select({ elevatorUnityId: workOrderElevators.elevatorUnityId })
+          .from(workOrderElevators)
+          .innerJoin(workOrders, eq(workOrderElevators.workOrderId, workOrders.id))
+          .where(and(
+            inArray(workOrderElevators.elevatorUnityId, dueStops.map((stop) => stop.elevatorUnityId)),
+            like(workOrders.scheduledDate, `${month}-%`),
+            eq(workOrders.serviceTypeId, prevServiceTypeId),
+            isNull(workOrders.deletedAt),
+            ne(workOrders.status, "CANCELLED"),
+            ownGeneratedIds.length > 0
+              ? notInArray(workOrders.id, ownGeneratedIds)
+              : undefined
+          ));
+        const existingIds = new Set(existingElevators.map((row) => row.elevatorUnityId));
+        const newStops = dueStops.filter((stop) => !existingIds.has(stop.elevatorUnityId));
+        if (newStops.length === 0) {
+          skipped += dueStops.length;
+          continue;
+        }
+
+        // Cualquier equipo con contrato caído invalida la visita completa.
+        const inactive = newStops.filter((s) => isContractInactive(s));
+        if (inactive.length > 0) {
+          errors.push({
+            stopId: first.id,
+            visitGroupId: first.visitGroupId,
+            businessDayNumber: route.businessDayNumber,
+            costCenterName: first.costCenterName,
+            equipmentCount: group.length,
+            message: inactive.some((s) => s.contractDeletedAt !== null)
+              ? "Contrato eliminado"
+              : "Contrato inactivo",
+          });
+          continue;
+        }
+
+        // Todos los equipos de una visita comparten la misma hora programada.
+        const times = new Set(newStops.map((s) => s.plannedTime));
+        if (times.size > 1) {
+          errors.push({
+            stopId: first.id,
+            visitGroupId: first.visitGroupId,
+            businessDayNumber: route.businessDayNumber,
+            costCenterName: first.costCenterName,
+            equipmentCount: group.length,
+            message: "La visita tiene horas distintas entre equipos",
+          });
+          continue;
+        }
+
+        pendingGroups.push({ key, stops: newStops, day: route.businessDayNumber, date });
+      }
+    }
+
+    // Visitas generadas parcialmente: libera la OT previa para no dejar OTs incompletas.
+    // Solo se liberan OTs del mes que se está regenerando; las de meses anteriores
+    // se conservan y su vínculo simplemente se sobrescribe.
+    const releasable: Array<{ group: (typeof pendingGroups)[number]; orphanIds: string[] }> = [];
+    for (const group of pendingGroups) {
+      const orphanIds = [
+        ...new Set(
+          group.stops
+            .filter((s) => s.generatedMonth === month)
+            .map((s) => s.generatedWorkOrderId)
+            .filter((id): id is string => id !== null)
+        ),
+      ];
+      if (orphanIds.length > 0) releasable.push({ group, orphanIds });
+    }
+
+    for (const { group, orphanIds } of releasable) {
+      for (const otId of orphanIds) {
+        const rows = await db
+          .select({
+            status: workOrders.status,
+            startedAt: workOrders.startedAt,
+            completedAt: workOrders.completedAt,
+            otNumber: workOrders.otNumber,
+          })
+          .from(workOrders)
+          .where(eq(workOrders.id, otId))
+          .limit(1);
+        const ot = rows[0];
+        if (!ot) continue;
+        if (ot.status !== "PENDING" || ot.startedAt || ot.completedAt) {
+          errors.push({
+            stopId: group.stops[0].id,
+            visitGroupId: group.stops[0].visitGroupId,
+            businessDayNumber: group.day,
+            costCenterName: group.stops[0].costCenterName,
+            equipmentCount: group.stops.length,
+            message: `${ot.otNumber} ya tiene ejecución registrada; regenérala manualmente`,
+          });
+          continue;
+        }
+        // Hard delete: la FK generated_work_order_id (ON DELETE SET NULL) libera los stops.
+        await db.delete(workOrders).where(eq(workOrders.id, otId));
+        for (const stop of group.stops) {
+          if (stop.generatedWorkOrderId !== otId) continue;
+          await db
+            .update(preventiveRouteStops)
+            .set({ generatedWorkOrderId: null })
+            .where(eq(preventiveRouteStops.id, stop.id));
+        }
+      }
+    }
+
+    // Una visita parcialmente generada que quedó con error no se genera.
+    const failedStopIds = new Set(errors.map((e) => e.stopId));
+    const readyGroups = pendingGroups.filter(
+      (g) => !failedStopIds.has(g.stops[0].id)
+    );
+
+    if (readyGroups.length === 0) {
+      revalidatePath("/routes");
+      return { success: true, month, created: 0, skipped, errors };
+    }
+
+    // Números de OT aleatorios; se evita colisión dentro de la misma corrida
+    // (el índice UNIQUE es la red de seguridad para el resto).
+    const usedOtNumbers = new Set(
+      (
+        await db
+          .select({ otNumber: workOrders.otNumber })
+          .from(workOrders)
+          .where(like(workOrders.otNumber, `OT-${month}-%`))
+      ).map((row) => row.otNumber)
+    );
+
+    const now = Math.floor(Date.now() / 1000);
+    const stmts: BatchItem<"sqlite">[] = [];
+    let created = 0;
+
+    for (const group of readyGroups) {
+      const first = group.stops[0];
+      const [hh, mm] = first.plannedTime.split(":").map(Number);
+      const scheduledTime = `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+      const [yyyy, monthNumber, dayNumber] = group.date.split("-").map(Number);
+      const estimatedStartAt = Math.floor(
+        Date.UTC(yyyy, monthNumber - 1, dayNumber, hh, mm) / 1000
+      ) + 5 * 60 * 60;
+      const estimatedEndAt = estimatedStartAt +
+        ROUTE_DEFAULTS.defaultStopDurationMins * group.stops.length * 60;
+      const woId = generateUuid();
+
+      // Prepara tareas y checklist de seguridad por equipo (misma lógica que la
+      // creación manual de una OT preventiva). Si un equipo no puede detallarse,
+      // la visita completa no se genera y se reporta el error.
+      const prepared: Array<{
+        workOrderElevatorId: string;
+        stop: (typeof group.stops)[number];
+        detail: PreventiveElevatorDetail;
+      }> = [];
+      let blockedReason: string | null = null;
+      for (const stop of group.stops) {
+        const workOrderElevatorId = generateUuid();
+        const detail = await buildPreventiveElevatorDetail({
+          workOrderElevatorId,
+          elevatorUnityId: stop.elevatorUnityId,
+          contractElevatorId: stop.contractElevatorId,
+          scheduledDate: group.date,
+        });
+        if (detail.errors.length > 0) {
+          blockedReason = [...new Set(detail.errors)].join(" ");
+          break;
+        }
+        prepared.push({ workOrderElevatorId, stop, detail });
+      }
+      if (blockedReason) {
+        errors.push({
+          stopId: first.id,
+          visitGroupId: first.visitGroupId,
+          businessDayNumber: group.day,
+          costCenterName: first.costCenterName,
+          equipmentCount: group.stops.length,
+          message: blockedReason,
+        });
+        continue;
+      }
+
+      // 1 visita = 1 OT
+      stmts.push(
+        db.insert(workOrders).values({
+          id: woId,
+          otNumber: uniqueDocumentNumber("OT", month, usedOtNumbers),
+          costCenterId: first.costCenterId,
+          technicianId,
+          serviceTypeId: prevServiceTypeId,
+          status: "PENDING",
+          priority: "NORMAL",
+           scheduledDate: group.date,
+           scheduledTime,
+           estimatedDurationMins: ROUTE_DEFAULTS.defaultStopDurationMins,
+           estimatedEndAt,
+        })
+      );
+
+      // N work_order_elevators (con sus tareas y checklist) + vínculo de cada stop
+      for (const { workOrderElevatorId, stop, detail } of prepared) {
+        stmts.push(
+          db.insert(workOrderElevators).values({
+            id: workOrderElevatorId,
+            workOrderId: woId,
+            elevatorUnityId: stop.elevatorUnityId,
+            contractElevatorId: stop.contractElevatorId,
+            status: "PENDING",
+          }),
+          ...detail.statements,
+          db
+            .update(preventiveRouteStops)
+            .set({
+              generatedWorkOrderId: woId,
+              generatedMonth: month,
+              generatedAt: now,
+            })
+            .where(eq(preventiveRouteStops.id, stop.id))
+        );
+      }
+
+      created++;
+    }
+
+    await db.batch(stmts as unknown as Parameters<typeof db.batch>[0]);
+
+    revalidatePath("/routes");
+    revalidatePath("/work-orders");
+
+    return { success: true, month, created, skipped, errors };
+  } catch (error) {
+    console.error("Error al generar OTs del mes:", error);
+    return { ...empty, error: getErrorMessage(error) };
+  }
+}
+
+// ==========================================
+// 6. TRASLADO DE UNA VISITA A OTRO TÉCNICO
+// ==========================================
+
+export type TransferVisitResult = {
+  success: boolean;
+  movedStops: number;
+  reassignedOrders: number;
+  blockedOrders: string[];
+  warnings: string[];
+  error?: string;
+  message?: string;
+};
+
+/**
+ * Traslada una sola visita (grupo de paradas) al tablero de otro técnico y
+ * reasigna la OT ya generada a la que pertenece, siempre que siga PENDING.
+ *
+ * Los conflictos de capacidad del técnico destino NO bloquean la operación:
+ * se devuelven como advertencias para que el destino reorganice sus días.
+ */
+export async function transferVisitToTechnician(
+  stopIds: string[],
+  toTechnicianId: string
+): Promise<TransferVisitResult> {
+  const denied = await denyUnless("routes:write");
+  if (denied) {
+    return { success: false, movedStops: 0, reassignedOrders: 0, blockedOrders: [], warnings: [], error: denied.error };
+  }
+  const empty: TransferVisitResult = {
+    success: false,
+    movedStops: 0,
+    reassignedOrders: 0,
+    blockedOrders: [],
+    warnings: [],
+  };
+  try {
+    if (!stopIds.length) return { ...empty, error: "La visita no tiene paradas." };
+    if (!toTechnicianId) return { ...empty, error: "Selecciona el técnico destino." };
+
+    const [target] = await db
+      .select({ id: users.id, fullName: users.fullName })
+      .from(users)
+      .innerJoin(roles, eq(users.roleId, roles.id))
+      .where(
+        and(
+          eq(users.id, toTechnicianId),
+          isNull(users.deletedAt),
+          eq(users.status, "ACTIVE"),
+          like(roles.name, "%TECNICO%")
+        )
+      )
+      .limit(1);
+    if (!target) {
+      return { ...empty, error: "El técnico destino no existe o no está activo." };
+    }
+
+    // La ruta de origen se resuelve desde las paradas: el cliente no la envía.
+    const stops = await db
+      .select({
+        id: preventiveRouteStops.id,
+        routeId: preventiveRouteStops.routeId,
+        generatedWorkOrderId: preventiveRouteStops.generatedWorkOrderId,
+        technicianId: preventiveRoutes.technicianId,
+        businessDayNumber: preventiveRoutes.businessDayNumber,
+      })
+      .from(preventiveRouteStops)
+      .innerJoin(
+        preventiveRoutes,
+        eq(preventiveRouteStops.routeId, preventiveRoutes.id)
+      )
+      .where(inArray(preventiveRouteStops.id, stopIds));
+    if (stops.length === 0) {
+      return { ...empty, error: "No se encontraron las paradas de la visita." };
+    }
+
+    const sourceRouteId = stops[0].routeId;
+    const fromTechnicianId = stops[0].technicianId;
+    const businessDayNumber = stops[0].businessDayNumber;
+    if (fromTechnicianId === toTechnicianId) {
+      return { ...empty, error: "El técnico destino debe ser distinto del actual." };
+    }
+
+    // Solo se mueven las paradas que realmente pertenecen a esa visita.
+    const movingIds = stops
+      .filter((s) => s.routeId === sourceRouteId)
+      .map((s) => s.id);
+    if (movingIds.length === 0) {
+      return { ...empty, error: "La visita no tiene paradas que trasladar." };
+    }
+
+    // Avisos de capacidad del destino: informativos, no bloquean.
+    const warnings: string[] = [];
+    const capacityWarning = await validateCapacityForMove(
+      toTechnicianId,
+      businessDayNumber,
+      movingIds
+    );
+    if (capacityWarning) {
+      warnings.push(`Día ${businessDayNumber}: ${capacityWarning}`);
+    }
+
+    // Las paradas se fusionan con la ruta que el destino ya tenga en ese día.
+    const targetRouteId = await ensureRoute(toTechnicianId, businessDayNumber);
+    const [{ maxIndex }] = await db
+      .select({ maxIndex: max(preventiveRouteStops.orderIndex) })
+      .from(preventiveRouteStops)
+      .where(eq(preventiveRouteStops.routeId, targetRouteId));
+    let seq = (maxIndex ?? 0) + 1;
+
+    const stmts: BatchItem<"sqlite">[] = [];
+    for (const id of movingIds) {
+      stmts.push(
+        db
+          .update(preventiveRouteStops)
+          .set({ routeId: targetRouteId, orderIndex: seq++ })
+          .where(eq(preventiveRouteStops.id, id))
+      );
+    }
+
+    // Reasigna la OT generada si sigue PENDING (mismo criterio que generateMonth).
+    const otIds = [
+      ...new Set(
+        stops
+          .map((s) => s.generatedWorkOrderId)
+          .filter((id): id is string => !!id)
+      ),
+    ];
+    const blockedOrders: string[] = [];
+    let reassignedOrders = 0;
+
+    for (const otId of otIds) {
+      const rows = await db
+        .select({
+          otNumber: workOrders.otNumber,
+          status: workOrders.status,
+          startedAt: workOrders.startedAt,
+          completedAt: workOrders.completedAt,
+          deletedAt: workOrders.deletedAt,
+        })
+        .from(workOrders)
+        .where(eq(workOrders.id, otId))
+        .limit(1);
+      const ot = rows[0];
+      if (!ot || ot.deletedAt) continue;
+      if (ot.status !== "PENDING" || ot.startedAt || ot.completedAt) {
+        blockedOrders.push(ot.otNumber);
+        continue;
+      }
+      stmts.push(
+        db
+          .update(workOrders)
+          .set({ technicianId: toTechnicianId })
+          .where(eq(workOrders.id, otId))
+      );
+      reassignedOrders++;
+    }
+
+    if (stmts.length > 0) {
+      await db.batch(stmts as unknown as Parameters<typeof db.batch>[0]);
+    }
+
+    if (blockedOrders.length > 0) {
+      warnings.push(
+        `${blockedOrders.length} OT(s) con ejecución registrada no se reasignaron: ${blockedOrders.join(", ")}`
+      );
+    }
+
+    revalidatePath("/routes");
+    revalidatePath("/work-orders");
+
+    return {
+      success: true,
+      movedStops: movingIds.length,
+      reassignedOrders,
+      blockedOrders,
+      warnings,
+      message: `Visita trasladada a ${target.fullName}`,
+    };
+  } catch (error) {
+    console.error("Error al trasladar visita a otro técnico:", error);
+    return { ...empty, error: getErrorMessage(error) };
+  }
+}
+
+export async function generateMonthForAllTechnicians(
+  month: string = nextMonthLabel()
+): Promise<GenerationResult> {
+  const denied = await denyUnless("routes:write");
+  if (denied) {
+    return { success: false, month, created: 0, skipped: 0, errors: [], error: denied.error };
+  }
+  const technicians = await db
+    .selectDistinct({ technicianId: preventiveRoutes.technicianId })
+    .from(preventiveRoutes)
+    .where(eq(preventiveRoutes.isActive, true));
+  const results = await Promise.all(
+    technicians.map((row) => generateMonth(row.technicianId, month))
+  );
+  return {
+    success: results.every((result) => result.success),
+    month,
+    created: results.reduce((sum, result) => sum + result.created, 0),
+    skipped: results.reduce((sum, result) => sum + result.skipped, 0),
+    errors: results.flatMap((result) => result.errors),
+    error: results.find((result) => result.error)?.error,
+  };
+}

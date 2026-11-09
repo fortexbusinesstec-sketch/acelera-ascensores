@@ -1,0 +1,1025 @@
+﻿import { sql } from "drizzle-orm";
+import {
+  AnySQLiteColumn,
+  index,
+  integer,
+  real,
+  sqliteTable,
+  text,
+  unique,
+  uniqueIndex,
+} from "drizzle-orm/sqlite-core";
+
+const unixNow = () => sql`(cast(strftime('%s','now') as int))`;
+
+export const roles = sqliteTable("roles", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  permissions: text("permissions", { mode: "json" }),
+  isActive: integer("is_active", { mode: "boolean" }).default(true),
+  // Marca los roles de personal de campo: habilita el perfil de tÃ©cnico.
+  isFieldRole: integer("is_field_role", { mode: "boolean" }).default(false),
+  createdAt: integer("created_at").default(unixNow()),
+});
+
+export const users = sqliteTable("users", {
+  id: text("id").primaryKey(),
+  email: text("email").notNull().unique(),
+  passwordHash: text("password_hash").notNull(),
+  fullName: text("full_name").notNull(),
+  phone: text("phone"),
+  roleId: text("role_id").notNull().references(() => roles.id),
+  status: text("status").default("ACTIVE"),
+  // Se incrementa para revocar las sesiones emitidas (ver SECURITY.md).
+  sessionVersion: integer("session_version").notNull().default(0),
+  lastLoginAt: integer("last_login_at"),
+  createdAt: integer("created_at").default(unixNow()),
+  deletedAt: integer("deleted_at"),
+});
+
+export const staffProfiles = sqliteTable("staff_profiles", {
+  userId: text("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+  documentType: text("document_type").notNull(),
+  documentNumber: text("document_number").notNull(),
+  specialization: text("specialization"),
+  providerType: text("provider_type").default("INTERNAL"),
+  providerCompany: text("provider_company"),
+  /** RelaciÃ³n con Acelera (ver src/lib/staff-relationship.ts). provider_type / provider_company se derivan de aquÃ­. */
+  relationshipType: text("relationship_type").default("INTERNAL_EMPLOYEE"),
+  /** Empresa proveedora a la que pertenece la cuenta (obligatoria en SUBCONTRACTED_COMPANY). */
+  supplierId: text("supplier_id").references((): AnySQLiteColumn => suppliers.id),
+  licenseNumber: text("license_number"),
+  signatureUrl: text("signature_url"),
+  hasSctr: integer("has_sctr", { mode: "boolean" }).default(false),
+  sctrExpiryDate: integer("sctr_expiry_date"),
+  baseSalary: real("base_salary"),
+  currentLatitude: real("current_latitude"),
+  currentLongitude: real("current_longitude"),
+  lastLocationUpdate: integer("last_location_update"),
+});
+
+export const clients = sqliteTable("clients", {
+  id: text("id").primaryKey(),
+  legalName: text("legal_name").notNull(),
+  taxId: text("tax_id").unique(),
+  taxIdType: text("tax_id_type").default("RUC"),
+  billingAddress: text("billing_address"),
+  billingEmail: text("billing_email"),
+  logoUrl: text("logo_url"),
+  status: text("status").default("ACTIVE"),
+  createdAt: integer("created_at").default(unixNow()),
+  deletedAt: integer("deleted_at"),
+});
+
+export const ubigeos = sqliteTable(
+  "ubigeos",
+  {
+    id: text("id").primaryKey(),
+    departamento: text("departamento").notNull(),
+    provincia: text("provincia").notNull(),
+    distrito: text("distrito").notNull(),
+    latitud: real("latitud"),
+    longitud: real("longitud"),
+    createdAt: integer("created_at").default(unixNow()),
+  },
+  (t) => [
+    index("idx_ubigeos_departamento").on(t.departamento),
+    index("idx_ubigeos_provincia").on(t.provincia),
+    index("idx_ubigeos_distrito").on(t.distrito),
+  ]
+);
+
+export const costCenters = sqliteTable("cost_center", {
+  id: text("id").primaryKey(),
+  clientId: text("client_id")
+    .notNull()
+    .references(() => clients.id, { onDelete: "restrict" }),
+  name: text("name").notNull(),
+  address: text("address").notNull(),
+  ubigeoId: text("ubigeo_id").references(() => ubigeos.id),
+  latitude: real("latitude"),
+  longitude: real("longitude"),
+  mainPhotoUrl: text("main_photo_url"),
+  passwordHash: text("password_hash"),
+  // Se incrementa para revocar las sesiones del portal de esta sede.
+  portalSessionVersion: integer("portal_session_version").notNull().default(0),
+  createdAt: integer("created_at").default(unixNow()),
+  deletedAt: integer("deleted_at"),
+});
+
+export const costCenterContacts = sqliteTable("cost_center_contacts", {
+  id: text("id").primaryKey(),
+  costCenterId: text("cost_center_id")
+    .notNull()
+    .references(() => costCenters.id, { onDelete: "cascade" }),
+  userId: text("user_id").references(() => users.id),
+  fullName: text("full_name").notNull(),
+  role: text("role").default("Administrador"),
+  phone: text("phone"),
+  email: text("email"),
+  signatureUrl: text("signature_url"),
+  isActive: integer("is_active", { mode: "boolean" }).default(true),
+});
+
+export const brands = sqliteTable("brands", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  country: text("country"),
+  isActive: integer("is_active", { mode: "boolean" }).default(true),
+});
+
+export const models = sqliteTable("models", {
+  id: text("id").primaryKey(),
+  brandId: text("brand_id")
+    .notNull()
+    .references(() => brands.id, { onDelete: "restrict" }),
+  name: text("name").notNull(),
+  techSpecs: text("tech_specs", { mode: "json" }),
+  isActive: integer("is_active", { mode: "boolean" }).default(true),
+});
+
+export const elevatorTypes = sqliteTable("elevator_types", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  isActive: integer("is_active", { mode: "boolean" }).default(true),
+});
+
+export const elevatorUnities = sqliteTable("elevator_unity", {
+  id: text("id").primaryKey(),
+  costCenterId: text("cost_center_id")
+    .notNull()
+    .references(() => costCenters.id, { onDelete: "restrict" }),
+  brandId: text("brand_id").references(() => brands.id),
+  modelId: text("model_id").references(() => models.id),
+  elevatorTypeId: text("elevator_type_id")
+    .notNull()
+    .references(() => elevatorTypes.id),
+
+  internalCode: text("internal_code").notNull(),
+  manufacturerSerial: text("manufacturer_serial"),
+  name: text("name").notNull(),
+
+  capacityPersons: integer("capacity_persons"),
+  capacityKg: integer("capacity_kg"),
+  speedMs: real("speed_ms"),
+  stops: integer("stops"),
+  floors: integer("floors"),
+  tractionType: text("traction_type"),
+  yearOfFabrication: integer("year_of_fabrication"),
+
+  status: text("status").default("OPERATIVE"),
+  installationDate: integer("installation_date"),
+  referencePhotos: text("reference_photos", { mode: "json" }),
+
+  createdAt: integer("created_at").default(unixNow()),
+  deletedAt: integer("deleted_at"),
+});
+
+export const serviceTypes = sqliteTable("service_types", {
+  id: text("id").primaryKey(),
+  code: text("code").notNull(),
+  name: text("name").notNull(),
+  category: text("category").notNull(),
+  requiresContract: integer("requires_contract", { mode: "boolean" }).default(false),
+  defaultSlaMins: integer("default_sla_mins"),
+  isBillableByDefault: integer("is_billable_by_default", { mode: "boolean" }).default(true),
+  isActive: integer("is_active", { mode: "boolean" }).default(true),
+  isSystem: integer("is_system", { mode: "boolean" }).default(false),
+  billingTrigger: text("billing_trigger").default("MANUAL"),
+  billingDelayDays: integer("billing_delay_days").default(0),
+  allowedDocumentTypes: text("allowed_document_types").default("FACTURA,BOLETA,NOTA_VENTA_INTERNA"),
+  /**
+   * Precio estandarizado (S/) que se propone en Cotizaciones al cobrar en modo
+   * manual. Opcional: NULL = sin precio fijo (p. ej. un correctivo). La columna es
+   * TEXT en la base: se lee siempre con `parseServicePrice`.
+   */
+  price: text("price"),
+  /** A quÃ© lÃ­nea de negocio pertenece: 'ELEVATOR' (ascensores) o 'GENERAL' (servicios generales). */
+  serviceScope: text("service_scope").default("ELEVATOR"),
+  /** Si el tipo de servicio se ofrece al armar las lÃ­neas de una cotizaciÃ³n. */
+  showInQuotations: integer("show_in_quotations", { mode: "boolean" }).default(false),
+  createdAt: integer("created_at").default(unixNow()),
+});
+
+export const contracts = sqliteTable("contracts", {
+  id: text("id").primaryKey(),
+  contractNumber: text("contract_number").notNull().unique(),
+  costCenterId: text("cost_center_id")
+    .notNull()
+    .references(() => costCenters.id, { onDelete: "restrict" }),
+  status: text("status").default("ACTIVE"),
+  serviceTypeId: text("service_type_id")
+    .notNull()
+    .references(() => serviceTypes.id, { onDelete: "restrict" }),
+  startDate: integer("start_date").notNull(),
+  endDate: integer("end_date"),
+  autoRenewal: integer("auto_renewal", { mode: "boolean" }).default(true),
+  noticePeriodDays: integer("notice_period_days").default(30),
+  currency: text("currency").default("PEN"),
+  baseAmount: real("base_amount").notNull(),
+  includesIgv: integer("includes_igv", { mode: "boolean" }).default(true),
+  paymentTermsDays: integer("payment_terms_days").default(5),
+  inflationAdjustment: integer("inflation_adjustment", { mode: "boolean" }).default(true),
+  /**
+   * Los mÃ³dulos del contrato determinan los meses fijos de ejecuciÃ³n.
+   */
+  slaEntrapmentMins: integer("sla_entrapment_mins").default(45),
+  slaMechanicalFailureMins: integer("sla_mechanical_failure_mins").default(180),
+  clientSignerName: text("client_signer_name"),
+  clientSignerDocument: text("client_signer_document"),
+  signatureDate: integer("signature_date"),
+  documentStatus: text("document_status").default("DRAFT"),
+  documentOverrides: text("document_overrides", { mode: "json" }),
+  // Legado: URL pÃºblica anterior. Los PDFs nuevos usan final_pdf_key.
+  finalPdfUrl: text("final_pdf_url"),
+  finalPdfKey: text("final_pdf_key"),
+  createdAt: integer("created_at").default(unixNow()),
+  deletedAt: integer("deleted_at"),
+});
+
+export const contractElevators = sqliteTable("contract_elevators", {
+  id: text("id").primaryKey(),
+  contractId: text("contract_id")
+    .notNull()
+    .references(() => contracts.id, { onDelete: "cascade" }),
+  elevatorUnityId: text("elevator_unity_id")
+    .notNull()
+    .references(() => elevatorUnities.id, { onDelete: "restrict" }),
+  frequencyMonths: integer("frequency_months").default(1),
+  price: real("price").notNull(),
+  addedAt: integer("added_at").default(unixNow()),
+});
+
+export const safetyTemplates = sqliteTable("safety_templates", {
+  id: text("id").primaryKey(),
+  type: text("type").notNull(),
+  equipmentTypeId: text("equipment_type_id").references(() => elevatorTypes.id),
+  name: text("name").notNull(),
+  version: text("version").default("v1.0"),
+  content: text("content", { mode: "json" }).notNull(),
+  isActive: integer("is_active", { mode: "boolean" }).default(true),
+  createdAt: integer("created_at").default(unixNow()),
+});
+
+export const workOrderSafetyRecords = sqliteTable("work_order_safety_records", {
+  id: text("id").primaryKey(),
+  workOrderId: text("work_order_id").notNull(),
+  templateId: text("template_id")
+    .notNull()
+    .references(() => safetyTemplates.id),
+  technicianId: text("technician_id")
+    .notNull()
+    .references(() => users.id),
+  status: text("status").default("DRAFT"),
+  responses: text("responses", { mode: "json" }).notNull(),
+  signatureUrl: text("signature_url"),
+  geolocation: text("geolocation", { mode: "json" }),
+  signedAt: integer("signed_at"),
+  createdAt: integer("created_at").default(unixNow()),
+});
+
+export const workOrders = sqliteTable("work_orders", {
+  id: text("id").primaryKey(),
+  otNumber: text("ot_number").notNull().unique(),
+  costCenterId: text("cost_center_id")
+    .notNull()
+    .references(() => costCenters.id, { onDelete: "restrict" }),
+  technicianId: text("technician_id").references(() => users.id),
+  serviceTypeId: text("service_type_id").references(() => serviceTypes.id),
+
+  status: text("status").default("PENDING"),
+  priority: text("priority").default("NORMAL"),
+
+  approvalStatus: text("approval_status").default("PENDING"),
+  approvedBy: text("approved_by"),
+  approvedAt: integer("approved_at"),
+
+  scheduledDate: text("scheduled_date"),
+  scheduledTime: text("scheduled_time"),
+  startedAt: integer("started_at"),
+  completedAt: integer("completed_at"),
+
+  supportingTechnicians: text("supporting_technicians"),
+  estimatedDurationMins: integer("estimated_duration_mins"),
+  estimatedEndAt: integer("estimated_end_at"),
+  parentWorkOrderId: text("parent_work_order_id").references((): AnySQLiteColumn => workOrders.id),
+  derivationReason: text("derivation_reason"),
+  closeTimeSource: text("close_time_source").default("MANUAL"),
+
+  checkinLatitude: real("checkin_latitude"),
+  checkinLongitude: real("checkin_longitude"),
+
+  closingNotes: text("closing_notes"),
+  description: text("description"),
+  clientSignatureUrl: text("client_signature_url"),
+  clientSignerName: text("client_signer_name"),
+  filledByAdmin: integer("filled_by_admin", { mode: "boolean" }).default(false),
+  manualReportNumber: text("manual_report_number"),
+  manualReportPhotoUrl: text("manual_report_photo_url"),
+  /** Cotizaciu00f3n de origen que derivu00f3 en esta OT (referencia informativa). */
+  quotationId: text("quotation_id").references((): AnySQLiteColumn => quotations.id, { onDelete: "set null" }),
+
+  createdAt: integer("created_at").default(unixNow()),
+  deletedAt: integer("deleted_at"),
+});
+
+export const workOrderElevators = sqliteTable("work_order_elevators", {
+  id: text("id").primaryKey(),
+  workOrderId: text("work_order_id")
+    .notNull()
+    .references(() => workOrders.id, { onDelete: "cascade" }),
+  elevatorUnityId: text("elevator_unity_id")
+    .notNull()
+    .references(() => elevatorUnities.id, { onDelete: "restrict" }),
+  contractElevatorId: text("contract_elevator_id").references(() => contractElevators.id),
+  status: text("status").default("PENDING"),
+  finding: text("finding"),
+  evidencePhotoUrls: text("evidence_photo_urls", { mode: "json" }),
+  finalStatus: text("final_equipment_status"),
+  startedAt: integer("started_at"),
+  completedAt: integer("completed_at"),
+});
+
+/**
+ * Servicio general atendido en una OT (limpieza, jardinerÃ­a, etc.): el hermano
+ * de work_order_elevators. Una OT es de ascensores o de servicios generales
+ * segÃºn el alcance de su tipo de servicio; nunca mezcla ambos.
+ */
+export const workOrderServices = sqliteTable(
+  "work_order_services",
+  {
+    id: text("id").primaryKey(),
+    workOrderId: text("work_order_id")
+      .notNull()
+      .references(() => workOrders.id, { onDelete: "cascade" }),
+    serviceTypeId: text("service_type_id").references(() => serviceTypes.id),
+    /** DÃ³nde se realiza dentro de la sede: "BaÃ±os piso 1", "JardÃ­n exterior". */
+    locationDescription: text("location_description"),
+    description: text("description"),
+    status: text("status").default("PENDING"),
+    startedAt: integer("started_at"),
+    completedAt: integer("completed_at"),
+    finalStatus: text("final_status"),
+    observations: text("observations"),
+    orderIndex: integer("order_index").default(0),
+    createdAt: integer("created_at").default(unixNow()),
+  },
+  (t) => [index("idx_wos_work_order").on(t.workOrderId)]
+);
+
+export const workOrderServiceTasks = sqliteTable(
+  "work_order_service_tasks",
+  {
+    id: text("id").primaryKey(),
+    workOrderServiceId: text("work_order_service_id")
+      .notNull()
+      .references(() => workOrderServices.id, { onDelete: "cascade" }),
+    taskDescription: text("task_description").notNull(),
+    isCritical: integer("is_critical", { mode: "boolean" }).default(false),
+    isCompleted: integer("is_completed", { mode: "boolean" }).default(false),
+    status: text("status").default("PENDING"),
+    requiresPhoto: integer("requires_photo", { mode: "boolean" }).default(false),
+    observations: text("observations"),
+    evidencePhotoUrl: text("evidence_photo_url"),
+    completedAt: integer("completed_at"),
+    orderIndex: integer("order_index").default(0),
+  },
+  (t) => [index("idx_wost_service").on(t.workOrderServiceId)]
+);
+
+export const reports = sqliteTable("reports", {
+  id: text("id").primaryKey(),
+  workOrderId: text("work_order_id").notNull().references(() => workOrders.id),
+  equipmentId: text("equipment_id").references(() => elevatorUnities.id),
+  reportCategory: text("report_category").notNull(),
+  reportType: text("report_type").notNull(),
+  issueDescription: text("issue_description").notNull(),
+  observations: text("observations"),
+  status: text("status").default("Borrador"),
+  finalPdfUrl: text("final_pdf_url"),
+  createdAt: integer("created_at").default(unixNow()),
+  updatedAt: integer("updated_at").default(unixNow()),
+});
+
+export const workOrderTasks = sqliteTable("work_order_tasks", {
+  id: text("id").primaryKey(),
+  workOrderElevatorId: text("work_order_elevator_id")
+    .notNull()
+    .references(() => workOrderElevators.id, { onDelete: "cascade" }),
+  taskDescription: text("task_description").notNull(),
+  maintenanceTaskId: text("maintenance_task_id").references(() => maintenanceTasks.id, { onDelete: "restrict" }),
+  moduleId: text("module_id").references(() => maintenanceModules.id, { onDelete: "restrict" }),
+  isCritical: integer("is_critical", { mode: "boolean" }).default(false),
+  isCompleted: integer("is_completed", { mode: "boolean" }).default(false),
+  status: text("status").default("PENDING"),
+  requiresPhoto: integer("requires_photo", { mode: "boolean" }).default(false),
+  observations: text("observations"),
+  evidencePhotoUrl: text("evidence_photo_url"),
+  completedAt: integer("completed_at"),
+});
+
+export const workOrderElevatorSafety = sqliteTable("work_order_elevator_safety", {
+  id: text("id").primaryKey(),
+  workOrderElevatorId: text("work_order_elevator_id").notNull().references(() => workOrderElevators.id, { onDelete: "cascade" }),
+  templateId: text("template_id").notNull().references(() => safetyTemplates.id),
+  templateVersion: text("template_version"),
+  templateSnapshot: text("template_snapshot", { mode: "json" }),
+  status: text("status").default("PENDING"),
+  technicianSignatureUrl: text("technician_signature_url"),
+  clientSignatureUrl: text("client_signature_url"),
+  geolocation: text("geolocation", { mode: "json" }),
+  notes: text("notes"),
+  completedAt: integer("completed_at"),
+  createdAt: integer("created_at").default(unixNow()),
+});
+
+export const workOrderElevatorSafetyItems = sqliteTable("work_order_elevator_safety_items", {
+  id: text("id").primaryKey(),
+  safetyRecordId: text("safety_record_id").notNull().references(() => workOrderElevatorSafety.id, { onDelete: "cascade" }),
+  question: text("question").notNull(),
+  response: text("response"),
+  observations: text("observations"),
+  photoUrl: text("photo_url"),
+  orderIndex: integer("order_index").default(0),
+  answeredAt: integer("answered_at"),
+});
+
+export const workOrderElevatorPhotos = sqliteTable(
+  "work_order_elevator_photos",
+  {
+    id: text("id").primaryKey(),
+    workOrderElevatorId: text("work_order_elevator_id")
+      .notNull()
+      .references(() => workOrderElevators.id, { onDelete: "cascade" }),
+    workOrderTaskId: text("work_order_task_id").references(() => workOrderTasks.id, { onDelete: "set null" }),
+    url: text("url").notNull(),
+    /** 'BEFORE' | 'AFTER' | 'POINT' */
+    tag: text("tag").notNull(),
+    description: text("description"),
+    createdAt: integer("created_at").default(unixNow()),
+  },
+  (t) => [index("idx_woep_elevator").on(t.workOrderElevatorId)]
+);
+
+export const preventiveRoutes = sqliteTable(
+  "preventive_routes",
+  {
+    id: text("id").primaryKey(),
+    technicianId: text("technician_id")
+      .notNull()
+      .references(() => users.id),
+    businessDayNumber: integer("business_day_number").notNull(),
+    name: text("name"),
+    isActive: integer("is_active", { mode: "boolean" }).default(true),
+    createdAt: integer("created_at").default(unixNow()),
+  },
+  (t) => [unique().on(t.technicianId, t.businessDayNumber)]
+);
+
+export const preventiveRouteConfig = sqliteTable("preventive_route_config", {
+  technicianId: text("technician_id")
+    .primaryKey()
+    .references(() => users.id, { onDelete: "cascade" }),
+  totalDays: integer("total_days").default(10),
+  maxDays: integer("max_days").default(15),
+  includeSaturdays: integer("include_saturdays", { mode: "boolean" }).default(true),
+  saturdayMaxHours: integer("saturday_max_hours").default(4),
+  defaultStopDurationMins: integer("default_stop_duration_mins").default(120),
+  updatedAt: integer("updated_at").default(unixNow()),
+});
+
+export const preventiveRouteStops = sqliteTable(
+  "preventive_route_stops",
+  {
+    id: text("id").primaryKey(),
+    routeId: text("route_id")
+      .notNull()
+      .references(() => preventiveRoutes.id, { onDelete: "cascade" }),
+    contractElevatorId: text("contract_elevator_id")
+      .notNull()
+      .references(() => contractElevators.id),
+    plannedTime: text("planned_time").notNull(),
+    orderIndex: integer("order_index").default(0),
+    visitGroupId: text("visit_group_id"),
+    estimatedDurationMins: integer("estimated_duration_mins").default(120),
+    generatedWorkOrderId: text("generated_work_order_id").references(() => workOrders.id, {
+      onDelete: "set null",
+    }),
+    generatedMonth: text("generated_month"),
+    generatedAt: integer("generated_at"),
+    createdAt: integer("created_at").default(unixNow()),
+  },
+  (t) => [
+    index("idx_prs_generated_month").on(t.generatedMonth),
+    index("idx_prs_visit_group").on(t.visitGroupId),
+  ]
+);
+
+export const invoices = sqliteTable(
+  "invoices",
+  {
+    id: text("id").primaryKey(),
+    documentType: text("document_type").notNull(),
+    series: text("series"),
+    number: text("number"),
+    clientId: text("client_id")
+      .notNull()
+      .references(() => clients.id, { onDelete: "restrict" }),
+    costCenterId: text("cost_center_id").references(() => costCenters.id, { onDelete: "restrict" }),
+    contractId: text("contract_id").references(() => contracts.id, { onDelete: "restrict" }),
+    workOrderId: text("work_order_id").references(() => workOrders.id, { onDelete: "restrict" }),
+    issueDate: integer("issue_date"),
+    dueDate: integer("due_date"),
+    taxPeriod: text("tax_period"),
+    currency: text("currency").default("PEN"),
+    total: real("total").notNull(),
+    taxableBase: real("taxable_base"),
+    igv: real("igv"),
+    rentaRate: real("renta_rate").default(0),
+    rentaAmount: real("renta_amount").default(0),
+    detractionRate: real("detraction_rate").default(0),
+    detractionAmount: real("detraction_amount").default(0),
+    netPayable: real("net_payable"),
+    sunatStatus: text("sunat_status").default("DRAFT"),
+    paymentStatus: text("payment_status").default("PENDING"),
+    clientTaxIdSnapshot: text("client_tax_id_snapshot"),
+    clientTaxIdTypeSnapshot: text("client_tax_id_type_snapshot"),
+    clientNameSnapshot: text("client_name_snapshot"),
+    clientAddressSnapshot: text("client_address_snapshot"),
+    payerType: text("payer_type").default("COST_CENTER"),
+    payerTaxIdType: text("payer_tax_id_type"),
+    payerTaxId: text("payer_tax_id"),
+    payerName: text("payer_name"),
+    payerCommercialName: text("payer_commercial_name"),
+    payerPhone: text("payer_phone"),
+    payerEmail: text("payer_email"),
+    payerRelationship: text("payer_relationship"),
+    payerNotes: text("payer_notes"),
+    createdAt: integer("created_at").default(unixNow()),
+    updatedAt: integer("updated_at").default(unixNow()),
+  },
+  (t) => [
+    uniqueIndex("invoices_doc_series_number_unique")
+      .on(t.documentType, t.series, t.number)
+      .where(sql`${t.number} IS NOT NULL`),
+    index("idx_invoices_payer_type").on(t.payerType),
+    index("idx_invoices_payer_tax_id")
+      .on(t.payerTaxId)
+      .where(sql`${t.payerTaxId} IS NOT NULL`),
+  ]
+);
+
+export const invoiceItems = sqliteTable("invoice_items", {
+  id: text("id").primaryKey(),
+  invoiceId: text("invoice_id")
+    .notNull()
+    .references(() => invoices.id, { onDelete: "cascade" }),
+  serviceTypeId: text("service_type_id").references(() => serviceTypes.id),
+  description: text("description").notNull(),
+  sourceType: text("source_type"),
+  sourceId: text("source_id"),
+  quantity: real("quantity").default(1),
+  unitPrice: real("unit_price").notNull(),
+  subtotal: real("subtotal").notNull(),
+  igv: real("igv").notNull(),
+  total: real("total").notNull(),
+  createdAt: integer("created_at").default(unixNow()),
+});
+
+export const laborConfig = sqliteTable("labor_config", {
+  id: text("id").primaryKey(),
+  hourlyCost: real("hourly_cost").notNull(),
+  updatedAt: integer("updated_at").default(unixNow()),
+});
+
+export const pricingConfig = sqliteTable("pricing_config", {
+  id: text("id").primaryKey(),
+  // Mano de obra
+  overheadRateLabor: real("overhead_rate_labor").default(0.4),
+  // Cotizador
+  overheadRateQuote: real("overhead_rate_quote").default(0.2),
+  commissionRate: real("commission_rate").default(0.05),
+  profitRate: real("profit_rate").default(0.6),
+  igvRate: real("igv_rate").default(0.18),
+  // Reglas
+  allowPriceOverride: integer("allow_price_override", { mode: "boolean" }).default(true),
+  allowCostOverride: integer("allow_cost_override", { mode: "boolean" }).default(true),
+  maintenanceGraceDays: integer("maintenance_grace_days").default(15),
+  updatedAt: integer("updated_at").default(unixNow()),
+});
+
+export const quotations = sqliteTable("quotations", {
+  id: text("id").primaryKey(),
+  quotationNumber: text("quotation_number").notNull().unique(),
+  clientId: text("client_id")
+    .notNull()
+    .references(() => clients.id),
+  costCenterId: text("cost_center_id").references(() => costCenters.id),
+  advisorId: text("advisor_id").references(() => users.id),
+  issueDate: integer("issue_date").notNull(),
+  validUntil: integer("valid_until").notNull(),
+  status: text("status").default("DRAFT"),
+  discountMode: text("discount_mode").default("PERCENT"),
+  targetTotal: real("target_total"),
+  targetTotalIncludesIgv: integer("target_total_includes_igv", { mode: "boolean" }).default(true),
+  discountRate: real("discount_rate").default(0),
+  subtotal: real("subtotal").default(0),
+  discountAmount: real("discount_amount").default(0),
+  taxableBase: real("taxable_base").default(0),
+  igv: real("igv").default(0),
+  total: real("total").default(0),
+  welcomeMessage: text("welcome_message"),
+  closeMessage: text("close_message"),
+  paymentTerms: text("payment_terms"),
+  executionTime: text("execution_time"),
+  workingHours: text("working_hours"),
+  validityDays: integer("validity_days").default(15),
+  showTaxBreakdown: integer("show_tax_breakdown", { mode: "boolean" }).default(true),
+  configSnapshot: text("config_snapshot"),
+  // Legado: URL pÃºblica anterior. Los PDFs nuevos usan pdf_key (bucket privado).
+  pdfUrl: text("pdf_url"),
+  pdfKey: text("pdf_key"),
+  pdfGeneratedAt: integer("pdf_generated_at"),
+  createdAt: integer("created_at").default(unixNow()),
+});
+
+export const quotationImages = sqliteTable(
+  "quotation_images",
+  {
+    id: text("id").primaryKey(),
+    quotationId: text("quotation_id")
+      .notNull()
+      .references(() => quotations.id, { onDelete: "cascade" }),
+    url: text("url").notNull(),
+    caption: text("caption"),
+    orderIndex: integer("order_index").default(0),
+    isReferenceOnly: integer("is_reference_only", { mode: "boolean" }).default(false),
+    createdAt: integer("created_at").default(unixNow()),
+  },
+  (table) => ({
+    quotationIdx: index("idx_quotation_images_quotation_id").on(table.quotationId),
+  })
+);
+
+export const quotationLines = sqliteTable("quotation_lines", {
+  id: text("id").primaryKey(),
+  quotationId: text("quotation_id")
+    .notNull()
+    .references(() => quotations.id, { onDelete: "cascade" }),
+  elevatorUnityId: text("elevator_unity_id").references(() => elevatorUnities.id),
+  /** Tipo de servicio de la lÃ­nea (opcional); el listado de cotizaciones filtra por Ã©l. */
+  serviceTypeId: text("service_type_id").references(() => serviceTypes.id, {
+    onDelete: "set null",
+  }),
+  equipmentSerial: text("equipment_serial"),
+  description: text("description"),
+  orderIndex: integer("order_index").default(0),
+  lineMode: text("line_mode").default("CALCULATED"),
+  lineModeReason: text("line_mode_reason"),
+  manualPrice: real("manual_price"),
+  manualPriceIncludesIgv: integer("manual_price_includes_igv", { mode: "boolean" }).default(true),
+  supplierName: text("supplier_name"),
+  supplierCost: real("supplier_cost"),
+  lineOverridePrice: real("line_override_price"),
+  lineOverrideReason: text("line_override_reason"),
+  /** Descuento de la lÃ­nea: NULL = sin descuento, 'PERCENT' o 'AMOUNT'. */
+  lineDiscountMode: text("line_discount_mode"),
+  /** Valor digitado: porcentaje (PERCENT) o soles con IGV (AMOUNT). */
+  lineDiscountValue: real("line_discount_value"),
+  /** Descuento efectivo en soles con IGV. clientValue/igv/clientPrice ya lo restan. */
+  lineDiscountAmount: real("line_discount_amount").default(0),
+
+  totalHours: real("total_hours").default(0),
+  hourlyCost: real("hourly_cost").default(0),
+  laborCost: real("labor_cost").default(0),
+
+  productCost: real("product_cost").default(0),
+
+  subtotal: real("subtotal").default(0),
+  overheadRate: real("overhead_rate").default(0.2),
+  overheadAmount: real("overhead_amount").default(0),
+  totalCost: real("total_cost").default(0),
+  commissionRate: real("commission_rate").default(0.04),
+  commissionAmount: real("commission_amount").default(0),
+  profitRate: real("profit_rate").default(0.6),
+  profitAmount: real("profit_amount").default(0),
+  clientValue: real("client_value").default(0),
+  igv: real("igv").default(0),
+  clientPrice: real("client_price").default(0),
+
+  createdAt: integer("created_at").default(unixNow()),
+});
+
+export const quotationLineProducts = sqliteTable("quotation_line_products", {
+  id: text("id").primaryKey(),
+  quotationLineId: text("quotation_line_id")
+    .notNull()
+    .references(() => quotationLines.id, { onDelete: "cascade" }),
+  description: text("description").notNull(),
+  quantity: real("quantity").default(1),
+  unit: text("unit"),
+  unitCost: real("unit_cost").notNull(),
+  totalCost: real("total_cost"),
+  orderIndex: integer("order_index").default(0),
+});
+
+// ==========================================
+// MANTENIMIENTO PREVENTIVO Y REPUESTOS
+// ==========================================
+
+export const maintenanceModules = sqliteTable("maintenance_modules", {
+  id: text("id").primaryKey(),
+  /** CÃ³digo de mÃ³dulo M1..M8. Ãšnico por tipo de equipo, no global. */
+  code: text("code").notNull(),
+  name: text("name").notNull(),
+  description: text("description"),
+  monthsOfYear: text("months_of_year").notNull(),
+  elevatorTypeId: text("elevator_type_id").references(() => elevatorTypes.id),
+  isActive: integer("is_active", { mode: "boolean" }).default(true),
+}, (t) => [unique("maintenance_modules_type_code_unique").on(t.elevatorTypeId, t.code)]);
+
+export const maintenanceZones = sqliteTable(
+  "maintenance_zones",
+  {
+    id: text("id").primaryKey(),
+    code: text("code").notNull().unique(),
+    name: text("name").notNull(),
+    orderIndex: integer("order_index").notNull().default(0),
+    isActive: integer("is_active", { mode: "boolean" }).default(true),
+    elevatorTypeId: text("elevator_type_id").references(() => elevatorTypes.id),
+  },
+  (t) => [index("idx_mz_order").on(t.orderIndex)]
+);
+
+export const maintenanceTasks = sqliteTable("maintenance_tasks", {
+  id: text("id").primaryKey(),
+  moduleId: text("module_id")
+    .notNull()
+    .references(() => maintenanceModules.id),
+  /** Foso, Cabina, Puerta, etc. */
+  zone: text("zone").notNull(),
+  zoneId: text("zone_id").references(() => maintenanceZones.id, { onDelete: "restrict" }),
+  description: text("description").notNull(),
+  isCritical: integer("is_critical", { mode: "boolean" }).default(false),
+  orderIndex: integer("order_index").default(0),
+  requiresPhoto: integer("requires_photo", { mode: "boolean" }).default(false),
+  isActive: integer("is_active", { mode: "boolean" }).default(true),
+});
+
+export const contractElevatorModuleExecutions = sqliteTable(
+  "contract_elevator_module_executions",
+  {
+    id: text("id").primaryKey(),
+    contractElevatorId: text("contract_elevator_id")
+      .notNull()
+      .references(() => contractElevators.id, { onDelete: "cascade" }),
+    moduleId: text("module_id")
+      .notNull()
+      .references(() => maintenanceModules.id, { onDelete: "restrict" }),
+    workOrderId: text("work_order_id")
+      .notNull()
+      .references(() => workOrders.id, { onDelete: "restrict" }),
+    executedAt: integer("executed_at").notNull(),
+    technicianId: text("technician_id").references(() => users.id, { onDelete: "set null" }),
+    notes: text("notes"),
+    createdAt: integer("created_at").default(unixNow()),
+  },
+  (t) => [
+    unique("contract_elevator_module_executions_unique").on(t.workOrderId, t.moduleId),
+    index("idx_ceme_contract_elevator").on(t.contractElevatorId),
+    index("idx_ceme_module").on(t.moduleId),
+    index("idx_ceme_executed_at").on(t.executedAt),
+    index("idx_ceme_work_order").on(t.workOrderId),
+  ]
+);
+
+export const maintenanceTemplates = sqliteTable("maintenance_templates", {
+  id: text("id").primaryKey(),
+  moduleId: text("module_id").references(() => maintenanceModules.id),
+  name: text("name").notNull(),
+  version: text("version").default("v1.0"),
+  /** JSON con checklists */
+  content: text("content").notNull(),
+  isActive: integer("is_active", { mode: "boolean" }).default(true),
+  createdAt: integer("created_at").default(unixNow()),
+});
+
+export const elevatorComponents = sqliteTable("elevator_components", {
+  id: text("id").primaryKey(),
+  elevatorUnityId: text("elevator_unity_id")
+    .notNull()
+    .references(() => elevatorUnities.id),
+  /** JerarquÃ­a de componentes (auto-referencia). */
+  parentId: text("parent_id").references((): AnySQLiteColumn => elevatorComponents.id),
+  name: text("name").notNull(),
+  /** polea, cable, guiador, etc. */
+  componentType: text("component_type"),
+  serialNumber: text("serial_number"),
+  installDate: integer("install_date"),
+  status: text("status").default("OPERATIVE"),
+  createdAt: integer("created_at").default(unixNow()),
+});
+
+export const spareParts = sqliteTable("spare_parts", {
+  id: text("id").primaryKey(),
+  code: text("code").unique(),
+  name: text("name").notNull(),
+  brandId: text("brand_id").references(() => brands.id),
+  modelId: text("model_id").references(() => models.id),
+  unit: text("unit"),
+  stock: integer("stock").default(0),
+  minStock: integer("min_stock").default(0),
+  isActive: integer("is_active", { mode: "boolean" }).default(true),
+});
+
+export const componentReplacements = sqliteTable("component_replacements", {
+  id: text("id").primaryKey(),
+  elevatorComponentId: text("elevator_component_id")
+    .notNull()
+    .references(() => elevatorComponents.id),
+  sparePartId: text("spare_part_id").references(() => spareParts.id),
+  workOrderId: text("work_order_id").references(() => workOrders.id),
+  replacementDate: integer("replacement_date").notNull(),
+  notes: text("notes"),
+  createdAt: integer("created_at").default(unixNow()),
+});
+
+export const suppliers = sqliteTable("suppliers", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  /** RUC de la empresa proveedora. */
+  taxId: text("tax_id"),
+  contactName: text("contact_name"),
+  phone: text("phone"),
+  email: text("email"),
+  isActive: integer("is_active", { mode: "boolean" }).default(true),
+});
+
+export const purchaseOrders = sqliteTable("purchase_orders", {
+  id: text("id").primaryKey(),
+  supplierId: text("supplier_id").references(() => suppliers.id),
+  orderDate: integer("order_date"),
+  status: text("status").default("DRAFT"),
+  total: real("total"),
+  createdAt: integer("created_at").default(unixNow()),
+});
+
+export type Role = typeof roles.$inferSelect;
+export type NewRole = typeof roles.$inferInsert;
+export type User = typeof users.$inferSelect;
+export type NewUser = typeof users.$inferInsert;
+export type StaffProfile = typeof staffProfiles.$inferSelect;
+export type NewStaffProfile = typeof staffProfiles.$inferInsert;
+export type Client = typeof clients.$inferSelect;
+export type NewClient = typeof clients.$inferInsert;
+export type CostCenter = typeof costCenters.$inferSelect;
+export type NewCostCenter = typeof costCenters.$inferInsert;
+export type Ubigeo = typeof ubigeos.$inferSelect;
+export type NewUbigeo = typeof ubigeos.$inferInsert;
+export type CostCenterContact = typeof costCenterContacts.$inferSelect;
+export type NewCostCenterContact = typeof costCenterContacts.$inferInsert;
+export type Brand = typeof brands.$inferSelect;
+export type NewBrand = typeof brands.$inferInsert;
+export type Model = typeof models.$inferSelect;
+export type NewModel = typeof models.$inferInsert;
+export type ElevatorType = typeof elevatorTypes.$inferSelect;
+export type NewElevatorType = typeof elevatorTypes.$inferInsert;
+export type ElevatorUnity = typeof elevatorUnities.$inferSelect;
+export type NewElevatorUnity = typeof elevatorUnities.$inferInsert;
+export type ServiceType = typeof serviceTypes.$inferSelect;
+export type NewServiceType = typeof serviceTypes.$inferInsert;
+export type Contract = typeof contracts.$inferSelect;
+export type NewContract = typeof contracts.$inferInsert;
+export type ContractElevator = typeof contractElevators.$inferSelect;
+export type NewContractElevator = typeof contractElevators.$inferInsert;
+export type SafetyTemplate = typeof safetyTemplates.$inferSelect;
+export type NewSafetyTemplate = typeof safetyTemplates.$inferInsert;
+export type WorkOrderSafetyRecord = typeof workOrderSafetyRecords.$inferSelect;
+export type NewWorkOrderSafetyRecord = typeof workOrderSafetyRecords.$inferInsert;
+export type WorkOrder = typeof workOrders.$inferSelect;
+export type NewWorkOrder = typeof workOrders.$inferInsert;
+export type WorkOrderElevator = typeof workOrderElevators.$inferSelect;
+export type NewWorkOrderElevator = typeof workOrderElevators.$inferInsert;
+export type WorkOrderService = typeof workOrderServices.$inferSelect;
+export type WorkOrderServiceTask = typeof workOrderServiceTasks.$inferSelect;
+export type WorkOrderTask = typeof workOrderTasks.$inferSelect;
+export type NewWorkOrderTask = typeof workOrderTasks.$inferInsert;
+export type ContractElevatorModuleExecution = typeof contractElevatorModuleExecutions.$inferSelect;
+export type NewContractElevatorModuleExecution = typeof contractElevatorModuleExecutions.$inferInsert;
+export type PreventiveRoute = typeof preventiveRoutes.$inferSelect;
+export type NewPreventiveRoute = typeof preventiveRoutes.$inferInsert;
+export type PreventiveRouteStop = typeof preventiveRouteStops.$inferSelect;
+export type NewPreventiveRouteStop = typeof preventiveRouteStops.$inferInsert;
+export type Invoice = typeof invoices.$inferSelect;
+export type NewInvoice = typeof invoices.$inferInsert;
+export type InvoiceItem = typeof invoiceItems.$inferSelect;
+export type NewInvoiceItem = typeof invoiceItems.$inferInsert;
+export type Report = typeof reports.$inferSelect;
+export type NewReport = typeof reports.$inferInsert;
+export type LaborConfig = typeof laborConfig.$inferSelect;
+export type NewLaborConfig = typeof laborConfig.$inferInsert;
+export type PricingConfig = typeof pricingConfig.$inferSelect;
+export type NewPricingConfig = typeof pricingConfig.$inferInsert;
+export type Quotation = typeof quotations.$inferSelect;
+export type NewQuotation = typeof quotations.$inferInsert;
+export type QuotationLine = typeof quotationLines.$inferSelect;
+export type NewQuotationLine = typeof quotationLines.$inferInsert;
+export type QuotationLineProduct = typeof quotationLineProducts.$inferSelect;
+export type NewQuotationLineProduct = typeof quotationLineProducts.$inferInsert;
+export type MaintenanceModule = typeof maintenanceModules.$inferSelect;
+export type NewMaintenanceModule = typeof maintenanceModules.$inferInsert;
+export type MaintenanceZone = typeof maintenanceZones.$inferSelect;
+export type NewMaintenanceZone = typeof maintenanceZones.$inferInsert;
+export type MaintenanceTask = typeof maintenanceTasks.$inferSelect;
+export type NewMaintenanceTask = typeof maintenanceTasks.$inferInsert;
+export type MaintenanceTemplate = typeof maintenanceTemplates.$inferSelect;
+export type NewMaintenanceTemplate = typeof maintenanceTemplates.$inferInsert;
+export type ElevatorComponent = typeof elevatorComponents.$inferSelect;
+export type NewElevatorComponent = typeof elevatorComponents.$inferInsert;
+export type SparePart = typeof spareParts.$inferSelect;
+export type NewSparePart = typeof spareParts.$inferInsert;
+export type ComponentReplacement = typeof componentReplacements.$inferSelect;
+export type NewComponentReplacement = typeof componentReplacements.$inferInsert;
+export type Supplier = typeof suppliers.$inferSelect;
+export type NewSupplier = typeof suppliers.$inferInsert;
+export type PurchaseOrder = typeof purchaseOrders.$inferSelect;
+export type NewPurchaseOrder = typeof purchaseOrders.$inferInsert;
+export type WorkOrderElevatorPhoto = typeof workOrderElevatorPhotos.$inferSelect;
+export type NewWorkOrderElevatorPhoto = typeof workOrderElevatorPhotos.$inferInsert;
+
+// Fallos de inicio de sesiÃ³n para el rate limit (ver src/lib/rate-limit).
+export const loginAttempts = sqliteTable(
+  "login_attempts",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    // "staff" | "portal"
+    scope: text("scope").notNull(),
+    ip: text("ip").notNull(),
+    // Correo (personal) o id de la sede (portal).
+    identifier: text("identifier").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => [
+    index("idx_login_attempts_key").on(t.scope, t.ip, t.identifier, t.createdAt),
+    index("idx_login_attempts_created").on(t.createdAt),
+  ]
+);
+
+// Notas de voz de hallazgos, grabadas en la app de tÃ©cnicos. El archivo vive
+// en el bucket privado de R2 (`key`), nunca con URL pÃºblica.
+export const workOrderElevatorAudios = sqliteTable(
+  "work_order_elevator_audios",
+  {
+    // Lo genera la app: permite reintentar la subida sin duplicar.
+    id: text("id").primaryKey(),
+    workOrderElevatorId: text("work_order_elevator_id")
+      .notNull()
+      .references(() => workOrderElevators.id, { onDelete: "cascade" }),
+    key: text("key").notNull(),
+    durationMs: integer("duration_ms").notNull().default(0),
+    // NULL = nota de Hallazgos; si no, id de la foto desde la que se grabÃ³.
+    photoId: text("photo_id"),
+    transcript: text("transcript"),
+    // 'NONE' (sin transcripciÃ³n) | 'PENDING' | 'DONE' | 'FAILED'
+    transcriptStatus: text("transcript_status").notNull().default("NONE"),
+    createdAt: integer("created_at").notNull(),
+  },
+  (t) => [index("idx_woea_elevator").on(t.workOrderElevatorId)]
+);
+
+// Notas rÃ¡pidas del usuario desde el menÃº de herramientas del navbar.
+export const userNotes = sqliteTable(
+  "user_notes",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    title: text("title").notNull(),
+    content: text("content"),
+    color: text("color").default("#ffffff"),
+    createdAt: integer("created_at").default(unixNow()),
+    updatedAt: integer("updated_at").default(unixNow()),
+  },
+  (t) => [index("idx_user_notes_user_updated").on(t.userId, t.updatedAt)]
+);
+
+// Ãšltimas operaciones de la calculadora flotante, por usuario.
+export const calculatorHistory = sqliteTable(
+  "calculator_history",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    expression: text("expression").notNull(),
+    result: text("result").notNull(),
+    createdAt: integer("created_at").default(unixNow()),
+  },
+  (t) => [index("idx_calculator_history_user_created").on(t.userId, t.createdAt)]
+);
+
+export type UserNote = typeof userNotes.$inferSelect;
+export type NewUserNote = typeof userNotes.$inferInsert;
+export type CalculatorHistoryEntry = typeof calculatorHistory.$inferSelect;
+export type NewCalculatorHistoryEntry = typeof calculatorHistory.$inferInsert;

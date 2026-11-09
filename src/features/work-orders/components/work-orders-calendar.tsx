@@ -1,0 +1,1698 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { useSubmitTransition } from "@/lib/use-submit-transition";
+import { useRouter } from "next/navigation";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { toast } from "sonner";
+import { type ColumnDef } from "@tanstack/react-table";
+import {
+  ChevronLeft,
+  ChevronRight,
+  Plus,
+  Loader2,
+  ArrowUpDown,
+  Eye,
+  Trash2,
+  CalendarDays,
+  List,
+  SlidersHorizontal,
+  X,
+  CalendarClock,
+  Clock,
+  CheckSquare,
+  Building2,
+  User2,
+  Info,
+  Cpu,
+} from "lucide-react";
+
+import {
+  type WorkOrderWithRelations,
+  type WorkOrderElevatorWithRelations,
+  type WorkOrdersFormData,
+  createWorkOrder,
+  updateWorkOrderStatus,
+  deleteWorkOrder,
+  getNextOtNumber,
+} from "../actions";
+import { workOrderFormSchema, type WorkOrderFormValues } from "../schema";
+import { DataTable } from "@/components/ui/data-table";
+import { WorkOrderDetail } from "./work-order-detail";
+import { emptyServiceItem, WorkOrderServicesField } from "./work-order-services-field";
+import type { WorkOrderServiceWithRelations } from "../services-actions";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
+
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
+import { SearchableSelect } from "@/components/ui/searchable-select";
+import { DatePicker } from "@/components/ui/date-picker";
+import { TimePicker } from "@/components/ui/time-picker";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+
+interface WorkOrdersCalendarProps {
+  initialWorkOrders: WorkOrderWithRelations[];
+  formData: WorkOrdersFormData;
+  initialWorkOrderElevators: WorkOrderElevatorWithRelations[];
+  initialWorkOrderServices: WorkOrderServiceWithRelations[];
+}
+
+const GENERAL_BADGE_CLASS =
+  "inline-flex shrink-0 rounded-full border border-violet-500/20 bg-violet-500/10 px-1.5 py-0.5 text-[9px] font-bold text-violet-600 dark:text-violet-400";
+
+const SCOPE_FILTER_OPTIONS = [
+  { id: "ELEVATOR", name: "Ascensores" },
+  { id: "GENERAL", name: "Servicios Generales" },
+];
+
+const STATUS_STYLES: Record<string, string> = {
+  PENDING: "bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20",
+  IN_PROGRESS: "bg-blue-500/10 text-[#0066CC] dark:text-blue-400 border-[#0066CC]/20",
+  REVIEW: "bg-purple-500/10 text-purple-600 dark:text-purple-400 border-purple-500/20",
+  COMPLETED: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20",
+  CANCELLED: "bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/20",
+};
+
+const STATUS_LABELS: Record<string, string> = {
+  PENDING: "Pendiente",
+  IN_PROGRESS: "En curso",
+  REVIEW: "En revisión",
+  COMPLETED: "Completada",
+  CANCELLED: "Cancelada",
+};
+
+const PRIORITY_STYLES: Record<string, string> = {
+  HIGH: "bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/20",
+  NORMAL: "bg-zinc-500/10 text-zinc-600 dark:text-zinc-400 border-zinc-500/20",
+  LOW: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20",
+};
+
+const LEGACY_TYPE_LABELS: Record<string, string> = {
+  CORRECTIVE: "Correctivo",
+  PREVENTIVE: "Preventivo",
+  PREDICTIVE: "Predictivo",
+  INSTALLATION: "Instalación",
+};
+
+const CATEGORY_LABELS: Record<string, string> = {
+  EMERGENCIA: "Emergencia",
+  MANTENIMIENTO: "Mantenimiento",
+  MODERNIZACION: "Modernización",
+  PROYECTO: "Proyecto",
+};
+
+const CATEGORY_ORDER = ["EMERGENCIA", "MANTENIMIENTO", "MODERNIZACION", "PROYECTO"];
+
+const PRIORITY_LABELS: Record<string, string> = {
+  HIGH: "Alta",
+  NORMAL: "Normal",
+  LOW: "Baja",
+};
+
+const WEEKDAYS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"];
+
+function toISO(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const da = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${da}`;
+}
+
+/** Lunes a domingo de la semana actual, en ISO. */
+function getWeekRange(): { start: string; end: string } {
+  const now = new Date();
+  const mondayIndex = (now.getDay() + 6) % 7;
+  const startDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - mondayIndex);
+  const endDate = new Date(startDate);
+  endDate.setDate(startDate.getDate() + 6);
+  return { start: toISO(startDate), end: toISO(endDate) };
+}
+
+function formatShortDate(date: string | null): string {
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) return "—";
+  const [y, m, d] = date.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString("es-PE", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+}
+
+function formatScheduled(date: string | null, time: string | null): string {
+  if (!date) return "—";
+  const base = formatShortDate(date);
+  if (!time) return base;
+  return `${base} · ${time}`;
+}
+
+function formatQuotationTotal(total: number | null): string {
+  if (total == null) return "";
+  return `S/ ${total.toLocaleString("es-PE", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function formatQuotationDate(unix: number | null): string {
+  if (!unix) return "";
+  return new Date(unix * 1000).toLocaleDateString("es-PE", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
+}
+
+const emptyValues: WorkOrderFormValues = {
+  clientId: "",
+  costCenterId: "",
+  serviceTypeId: "",
+  technicianId: "",
+  priority: "NORMAL",
+  scheduledDate: "",
+  scheduledTime: "",
+  elevatorUnityIds: [],
+  services: [],
+  description: "",
+  supportingTechnicians: "",
+  estimatedDurationMins: null,
+  quotationId: "",
+};
+
+export function WorkOrdersCalendar({
+  initialWorkOrders,
+  formData,
+  initialWorkOrderElevators,
+  initialWorkOrderServices,
+}: WorkOrdersCalendarProps) {
+  const router = useRouter();
+  const [isPending, startTransition] = useSubmitTransition();
+
+  const [view, setView] = useState<"calendar" | "list">("calendar");
+  const [currentMonth, setCurrentMonth] = useState(() => {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), 1);
+  });
+  const todayKey = toISO(new Date());
+
+  const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const [otPreview, setOtPreview] = useState("");
+  const [viewingWorkOrder, setViewingWorkOrder] = useState<WorkOrderWithRelations | null>(null);
+  const [viewingDay, setViewingDay] = useState<{ iso: string; label: string } | null>(null);
+  const [deletingWorkOrder, setDeletingWorkOrder] = useState<WorkOrderWithRelations | null>(null);
+  const [technicianFilter, setTechnicianFilter] = useState("all");
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const [weekFilter, setWeekFilter] = useState(false);
+  const [dayFilter, setDayFilter] = useState("");
+  const [clientFilter, setClientFilter] = useState("");
+  const [costCenterFilter, setCostCenterFilter] = useState("");
+  const [serviceTypeFilter, setServiceTypeFilter] = useState("");
+  const [scopeFilter, setScopeFilter] = useState("");
+
+  // En móvil la vista por defecto debe ser "Lista", no el calendario.
+  // Se ajusta tras el montaje para evitar mismatch en la hidratación SSR.
+  useEffect(() => {
+    if (typeof window !== "undefined" && window.innerWidth < 768) {
+      setView("list");
+    }
+  }, []);
+
+  const form = useForm<WorkOrderFormValues>({
+    resolver: zodResolver(workOrderFormSchema),
+    defaultValues: emptyValues,
+  });
+
+  const serviceTypeMap = useMemo(() => {
+    const map = new Map<string, (typeof formData.serviceTypes)[number]>();
+    for (const st of formData.serviceTypes) map.set(st.id, st);
+    return map;
+  }, [formData.serviceTypes]);
+
+  const generalServiceTypes = useMemo(
+    () => formData.serviceTypes.filter((st) => st.serviceScope === "GENERAL"),
+    [formData.serviceTypes]
+  );
+  /** Una OT es de servicios generales si lo es su tipo de servicio. */
+  const isGeneralOrder = (serviceTypeId: string | null | undefined) =>
+    serviceTypeMap.get(serviceTypeId ?? "")?.serviceScope === "GENERAL";
+
+  const selectedCostCenterId = form.watch("costCenterId");
+  const selectedServiceType = serviceTypeMap.get(form.watch("serviceTypeId"));
+  const selectedClientId = form.watch("clientId");
+  const isGeneral = selectedServiceType?.serviceScope === "GENERAL";
+  const isPreventive = selectedServiceType?.code === "PREV";
+  const isEmergency = selectedServiceType?.category === "EMERGENCY" || selectedServiceType?.code.startsWith("EMER");
+  const isCorrective = !isGeneral && selectedServiceType?.category === "MANTENIMIENTO" && !isPreventive;
+
+  const costCentersByClient = useMemo(() => {
+    if (!selectedClientId) return formData.costCenters;
+    return formData.costCenters.filter((cc) => cc.clientId === selectedClientId);
+  }, [selectedClientId, formData.costCenters]);
+
+  /** Cotizaciones del cliente y centro de costo elegidos (también las sin centro de costo). */
+  const quotationsForSelection = useMemo(() => {
+    if (!selectedClientId || !selectedCostCenterId) return [];
+    return formData.quotations.filter(
+      (q) => q.clientId === selectedClientId && (!q.costCenterId || q.costCenterId === selectedCostCenterId)
+    );
+  }, [formData.quotations, selectedClientId, selectedCostCenterId]);
+
+  const equipmentForCostCenter = useMemo(() => {
+    if (!selectedCostCenterId) return formData.equipmentOptions;
+    return formData.equipmentOptions.filter((e) => e.costCenterId === selectedCostCenterId);
+  }, [selectedCostCenterId, formData.equipmentOptions]);
+
+  const typeLabelOf = (type: string | null): string => {
+    if (!type) return "—";
+    const st = serviceTypeMap.get(type);
+    if (st) return `${st.name} (${st.code})`;
+    return LEGACY_TYPE_LABELS[type] ?? type;
+  };
+
+  const filteredWorkOrders = useMemo(
+    () => technicianFilter === "all"
+      ? initialWorkOrders
+      : initialWorkOrders.filter((workOrder) => workOrder.technicianId === technicianFilter),
+    [initialWorkOrders, technicianFilter]
+  );
+
+  const activeFilterCount =
+    (weekFilter ? 1 : 0) +
+    (dayFilter ? 1 : 0) +
+    (clientFilter ? 1 : 0) +
+    (costCenterFilter ? 1 : 0) +
+    (serviceTypeFilter ? 1 : 0) +
+    (scopeFilter ? 1 : 0);
+
+  const clientCostCenters = useMemo(() => {
+    if (!clientFilter) return formData.costCenters;
+    return formData.costCenters.filter((cc) => cc.clientId === clientFilter);
+  }, [clientFilter, formData.costCenters]);
+
+  const monthPrefix = useMemo(
+    () =>
+      `${currentMonth.getFullYear()}-${String(currentMonth.getMonth() + 1).padStart(2, "0")}`,
+    [currentMonth]
+  );
+
+  const clientIdByCostCenter = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const cc of formData.costCenters) map.set(cc.id, cc.clientId);
+    return map;
+  }, [formData.costCenters]);
+
+  const monthWorkOrders = useMemo(
+    () => initialWorkOrders.filter((wo) => wo.scheduledDate?.startsWith(monthPrefix)),
+    [initialWorkOrders, monthPrefix]
+  );
+
+  const clientsForMonth = useMemo(() => {
+    const ids = new Set<string>();
+    for (const wo of monthWorkOrders) {
+      const clientId = clientIdByCostCenter.get(wo.costCenterId);
+      if (clientId) ids.add(clientId);
+    }
+    return formData.clients.filter((client) => ids.has(client.id));
+  }, [monthWorkOrders, clientIdByCostCenter, formData.clients]);
+
+  const serviceTypesForMonth = useMemo(() => {
+    const ids = new Set<string>();
+    for (const wo of monthWorkOrders) {
+      if (!wo.serviceTypeId) continue;
+      if (clientFilter && clientIdByCostCenter.get(wo.costCenterId) !== clientFilter) continue;
+      ids.add(wo.serviceTypeId);
+    }
+    return formData.serviceTypes.filter((serviceType) => ids.has(serviceType.id));
+  }, [monthWorkOrders, clientIdByCostCenter, clientFilter, formData.serviceTypes]);
+
+  useEffect(() => {
+    if (view !== "calendar") return;
+    if (clientFilter && !clientsForMonth.some((client) => client.id === clientFilter)) {
+      setClientFilter("");
+    }
+  }, [view, clientFilter, clientsForMonth]);
+
+  useEffect(() => {
+    if (view !== "calendar") return;
+    if (serviceTypeFilter && !serviceTypesForMonth.some((type) => type.id === serviceTypeFilter)) {
+      setServiceTypeFilter("");
+    }
+  }, [view, serviceTypeFilter, serviceTypesForMonth]);
+
+  const matchedWorkOrders = useMemo(() => {
+    const clientCcIds = clientFilter
+      ? new Set(clientCostCenters.map((cc) => cc.id))
+      : null;
+    return filteredWorkOrders.filter((wo) => {
+      if (costCenterFilter && wo.costCenterId !== costCenterFilter) return false;
+      if (clientCcIds && !clientCcIds.has(wo.costCenterId)) return false;
+      if (serviceTypeFilter && wo.serviceTypeId !== serviceTypeFilter) return false;
+      if (scopeFilter && (scopeFilter === "GENERAL") !== (serviceTypeMap.get(wo.serviceTypeId ?? "")?.serviceScope === "GENERAL")) return false;
+      return true;
+    });
+  }, [
+    scopeFilter,
+    serviceTypeMap,
+    filteredWorkOrders,
+    clientFilter,
+    clientCostCenters,
+    costCenterFilter,
+    serviceTypeFilter,
+  ]);
+
+  const listWorkOrders = useMemo(() => {
+    const week = getWeekRange();
+    return matchedWorkOrders.filter((wo) => {
+      if (dayFilter && wo.scheduledDate !== dayFilter) return false;
+      if (
+        weekFilter &&
+        (!wo.scheduledDate || wo.scheduledDate < week.start || wo.scheduledDate > week.end)
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }, [matchedWorkOrders, dayFilter, weekFilter]);
+
+  function handleClientFilterChange(clientId: string) {
+    setClientFilter(clientId);
+    if (
+      costCenterFilter &&
+      !formData.costCenters.some((cc) => cc.id === costCenterFilter && cc.clientId === clientId)
+    ) {
+      setCostCenterFilter("");
+    }
+  }
+
+  function toggleWeekFilter() {
+    setWeekFilter((v) => !v);
+    setDayFilter("");
+  }
+
+  function handleDayFilterChange(iso: string) {
+    setDayFilter(iso);
+    setWeekFilter(false);
+  }
+
+  function clearListFilters() {
+    setWeekFilter(false);
+    setDayFilter("");
+    setClientFilter("");
+    setCostCenterFilter("");
+    setServiceTypeFilter("");
+    setScopeFilter("");
+  }
+
+  const woByDayKey = useMemo(() => {
+    const map = new Map<string, WorkOrderWithRelations[]>();
+    for (const wo of matchedWorkOrders) {
+      if (!wo.scheduledDate) continue;
+      map.set(wo.scheduledDate, [...(map.get(wo.scheduledDate) ?? []), wo]);
+    }
+    map.forEach((list) =>
+      list.sort((a, b) =>
+        `${a.scheduledDate ?? ""} ${a.scheduledTime ?? ""}`.localeCompare(
+          `${b.scheduledDate ?? ""} ${b.scheduledTime ?? ""}`
+        )
+      )
+    );
+    return map;
+  }, [matchedWorkOrders]);
+
+  const calCells = useMemo(() => {
+    const year = currentMonth.getFullYear();
+    const month = currentMonth.getMonth();
+    const firstDow = new Date(year, month, 1).getDay();
+    const offset = (firstDow + 6) % 7;
+    const daysInMonth = new Date(year, month + 1, 0).getDate();
+    const cells: Array<{ date: Date; day: number } | null> = [];
+    for (let i = 0; i < offset; i++) cells.push(null);
+    for (let d = 1; d <= daysInMonth; d++) cells.push({ date: new Date(year, month, d), day: d });
+    while (cells.length % 7 !== 0) cells.push(null);
+    return cells;
+  }, [currentMonth]);
+
+  const monthTitle = currentMonth.toLocaleDateString("es-PE", {
+    month: "long",
+    year: "numeric",
+  });
+
+  function changeMonth(delta: number) {
+    setCurrentMonth((d) => new Date(d.getFullYear(), d.getMonth() + delta, 1));
+  }
+
+  async function loadOtPreview(iso: string) {
+    const res = await getNextOtNumber(iso);
+    setOtPreview(res.otNumber || "");
+  }
+
+  function openCreate(date?: Date) {
+    const target = date ?? new Date();
+    const iso = toISO(target);
+    setOtPreview("");
+    form.reset({ ...emptyValues, scheduledDate: iso });
+    setIsCreateOpen(true);
+    void loadOtPreview(iso);
+  }
+
+  function handleDateChange(iso: string) {
+    form.setValue("scheduledDate", iso);
+    void loadOtPreview(iso);
+  }
+
+  function handleSubmit(values: WorkOrderFormValues) {
+    const st = serviceTypeMap.get(values.serviceTypeId);
+    if (st?.serviceScope === "GENERAL") {
+      if (values.services.length === 0) {
+        toast.error("Servicios requeridos", {
+          description: "Agrega al menos un servicio a realizar.",
+        });
+        return;
+      }
+    } else if (values.elevatorUnityIds.length === 0) {
+      form.setError("elevatorUnityIds", { message: "Selecciona al menos un equipo" });
+      return;
+    }
+    if (st?.code === "PREV" && values.elevatorUnityIds.length === 0) {
+      toast.error("Equipos requeridos", {
+        description: "Para un mantenimiento preventivo debes seleccionar al menos un equipo.",
+      });
+      return;
+    }
+    startTransition(async () => {
+      const res = await createWorkOrder(values);
+      if (res.success) {
+        toast.success("OT creada", { description: res.message });
+        setIsCreateOpen(false);
+        router.refresh();
+      } else {
+        toast.error("Error", { description: res.error });
+      }
+    });
+  }
+
+  function handleStatusChange(workOrder: WorkOrderWithRelations, status: string) {
+    startTransition(async () => {
+      const res = await updateWorkOrderStatus(workOrder.id, status);
+      if (res.success) {
+        toast.success("Estado actualizado", {
+          description: `La OT ${workOrder.otNumber} cambió a ${STATUS_LABELS[status] ?? status}.`,
+        });
+        router.refresh();
+      } else {
+        toast.error("Error", { description: res.error });
+      }
+    });
+  }
+
+  function handleDeleteConfirm() {
+    if (!deletingWorkOrder) return;
+    startTransition(async () => {
+      const res = await deleteWorkOrder(deletingWorkOrder.id);
+      if (res.success) {
+        toast.success("OT eliminada", { description: `Se eliminó ${deletingWorkOrder.otNumber}.` });
+        setDeletingWorkOrder(null);
+        router.refresh();
+      } else {
+        toast.error("Error al eliminar", { description: res.error });
+      }
+    });
+  }
+
+  const columns = useMemo<ColumnDef<WorkOrderWithRelations>[]>(
+    () => [
+      {
+        accessorKey: "otNumber",
+        header: ({ column }) => (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => column.toggleSorting(column.getIsSorted() === "asc")}
+            className="h-8 px-2 text-xs font-semibold hover:bg-muted/60"
+          >
+            N° OT
+            <ArrowUpDown className="ml-1.5 size-3 text-muted-foreground" />
+          </Button>
+        ),
+        cell: ({ row }) => (
+          <span className="font-mono text-xs font-semibold px-2 py-0.5 rounded bg-muted border border-border">
+            {row.getValue("otNumber")}
+          </span>
+        ),
+      },
+      {
+        accessorKey: "type",
+        header: "Tipo de Servicio",
+        cell: ({ row }) => (
+          <span className="flex flex-wrap items-center gap-1 text-xs text-muted-foreground font-semibold">
+            {isGeneralOrder(row.original.serviceTypeId) && (
+              <span className={GENERAL_BADGE_CLASS}>General</span>
+            )}
+            {typeLabelOf(row.getValue<string>("type"))}
+          </span>
+        ),
+      },
+      {
+        accessorKey: "client_name",
+        header: "Cliente",
+        cell: ({ row }) => (
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground max-w-[180px]">
+            <Building2 className="size-3 shrink-0" />
+            <span className="truncate">{row.getValue("client_name")}</span>
+          </div>
+        ),
+      },
+      {
+        accessorKey: "cost_center_name",
+        header: "Centro de Costo",
+        cell: ({ row }) => (
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground max-w-[200px]">
+            <Building2 className="size-3 shrink-0" />
+            <span className="truncate">{row.getValue("cost_center_name")}</span>
+          </div>
+        ),
+      },
+      {
+        accessorKey: "technician_name",
+        header: "Técnico",
+        cell: ({ row }) => {
+          const tech = row.getValue<string | null>("technician_name");
+          return tech ? (
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <User2 className="size-3 shrink-0" />
+              <span>{tech}</span>
+            </div>
+          ) : (
+            <span className="text-xs text-muted-foreground/50">—</span>
+          );
+        },
+      },
+      {
+        accessorKey: "priority",
+        header: "Prioridad",
+        cell: ({ row }) => {
+          const priority = row.getValue<string>("priority");
+          const style = PRIORITY_STYLES[priority] || PRIORITY_STYLES.NORMAL;
+          return (
+            <span className={`inline-flex px-2 py-0.5 rounded-full text-[10px] font-bold border ${style}`}>
+              {PRIORITY_LABELS[priority] ?? priority}
+            </span>
+          );
+        },
+      },
+      {
+        accessorKey: "scheduledDate",
+        header: "Programada",
+        cell: ({ row }) => (
+          <span className="inline-flex items-center gap-1.5 text-xs font-mono text-muted-foreground">
+            <CalendarClock className="size-3" />
+            {formatScheduled(
+              row.getValue<string | null>("scheduledDate"),
+              row.original.scheduledTime ?? null
+            )}
+          </span>
+        ),
+      },
+      {
+        accessorKey: "status",
+        header: "Estado",
+        cell: ({ row }) => {
+          const status = row.getValue<string>("status");
+          const style = STATUS_STYLES[status] || STATUS_STYLES.PENDING;
+          return (
+            <div className="flex flex-wrap items-center gap-1">
+              <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold border ${style}`}>
+                {STATUS_LABELS[status] ?? status}
+              </span>
+              {row.original.approvalStatus !== "APPROVED" && (
+                <span className="inline-flex rounded-full border border-amber-500/20 bg-amber-500/10 px-2 py-0.5 text-[10px] font-bold text-amber-600 dark:text-amber-400">
+                  Pendiente aprobación
+                </span>
+              )}
+              {row.original.approvalStatus === "APPROVED" && (
+                <span className="inline-flex rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-bold text-emerald-600 dark:text-emerald-400">
+                  Aprobada
+                </span>
+              )}
+            </div>
+          );
+        },
+      },
+      {
+        id: "actions",
+        header: () => <div className="text-right">Acciones</div>,
+        cell: ({ row }) => {
+          const workOrder = row.original;
+          const inProgress = workOrder.status === "IN_PROGRESS";
+          const notCompleted = workOrder.status !== "COMPLETED" && workOrder.status !== "CANCELLED";
+          return (
+            <div className="flex items-center justify-end gap-1.5">
+              <Button
+                variant="outline"
+                size="xs"
+                onClick={() => setViewingWorkOrder(workOrder)}
+                className="h-7 px-2.5 text-xs font-semibold text-[#0066CC] dark:text-blue-400 border-[#0066CC]/30 hover:bg-[#0066CC]/10 gap-1.5 shadow-2xs"
+              >
+                <Eye className="size-3" />
+                Detalle
+              </Button>
+              {inProgress && (
+                <Button
+                  variant="outline"
+                  size="xs"
+                  onClick={() => handleStatusChange(workOrder, "REVIEW")}
+                  className="h-7 px-2.5 text-xs font-semibold text-emerald-600 dark:text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/10 gap-1.5 shadow-2xs"
+                >
+                  Terminar
+                </Button>
+              )}
+              {notCompleted && workOrder.status !== "REVIEW" && workOrder.status !== "PENDING" && (
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={() => handleStatusChange(workOrder, "COMPLETED")}
+                  className="text-emerald-500 hover:text-emerald-700 hover:bg-emerald-500/10"
+                  title="Marcar completada"
+                >
+                  <CheckSquare className="size-3.5" />
+                </Button>
+              )}
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                onClick={() => setDeletingWorkOrder(workOrder)}
+                className="text-red-500 hover:text-red-700 hover:bg-red-500/10"
+                title="Eliminar OT"
+              >
+                <Trash2 className="size-3.5" />
+              </Button>
+            </div>
+          );
+        },
+      },
+    ],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [serviceTypeMap]
+  );
+
+  const viewingDayList = useMemo(() => {
+    if (!viewingDay) return [];
+    return matchedWorkOrders.filter((wo) => wo.scheduledDate === viewingDay.iso);
+  }, [viewingDay, matchedWorkOrders]);
+
+  const elevatorsByWorkOrder = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const e of initialWorkOrderElevators) {
+      map.set(e.workOrderId, (map.get(e.workOrderId) ?? 0) + 1);
+    }
+    return map;
+  }, [initialWorkOrderElevators]);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div className="flex items-center gap-2 rounded-lg border border-border bg-card p-1">
+          <button
+            type="button"
+            onClick={() => setView("calendar")}
+            className={`hidden md:inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors ${
+              view === "calendar"
+                ? "bg-[#0066CC] text-white"
+                : "text-muted-foreground hover:text-foreground hover:bg-muted"
+            }`}
+          >
+            <CalendarDays className="size-3.5" />
+            Calendario
+          </button>
+          <button
+            type="button"
+            onClick={() => setView("list")}
+            className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition-colors ${
+              view === "list"
+                ? "bg-[#0066CC] text-white"
+                : "text-muted-foreground hover:text-foreground hover:bg-muted"
+            }`}
+          >
+            <List className="size-3.5" />
+            Lista
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <select value={technicianFilter} onChange={(event) => setTechnicianFilter(event.target.value)} className="h-9 max-w-[220px] rounded-md border border-border bg-card px-3 text-xs" aria-label="Filtrar por técnico de campo">
+            <option value="all">Todos los técnicos</option>
+            {formData.technicians.map((technician) => <option key={technician.id} value={technician.id}>{technician.fullName}</option>)}
+          </select>
+          <Button onClick={() => openCreate()} className="bg-[#0066CC] hover:bg-[#0055AA] text-white font-semibold text-xs h-9 px-4 gap-2 shadow-xs shrink-0">
+            <Plus className="size-4" /> Nueva OT
+          </Button>
+        </div>
+      </div>
+
+      <div className={view === "calendar" ? "hidden md:block" : "hidden"}>
+        <div className="rounded-xl border border-border bg-card p-3 shadow-sm">
+          {/* Navegación de mes */}
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1">
+              <Button variant="outline" size="icon-sm" onClick={() => changeMonth(-1)} className="size-7" title="Mes anterior">
+                <ChevronLeft className="size-4" />
+              </Button>
+              <Button variant="outline" size="icon-sm" onClick={() => changeMonth(1)} className="size-7" title="Mes siguiente">
+                <ChevronRight className="size-4" />
+              </Button>
+              <span className="ml-1 text-sm font-bold capitalize text-foreground">
+                {monthTitle}
+              </span>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setCurrentMonth(new Date(new Date().getFullYear(), new Date().getMonth(), 1))}
+              className="text-xs h-8"
+            >
+              Hoy
+            </Button>
+          </div>
+
+          {/* Filtros del mes */}
+          <div className="mb-3 flex flex-wrap items-end gap-2">
+            <div className="w-full space-y-1 sm:w-[190px]">
+              <span className="block text-[10px] font-bold uppercase tracking-wide text-muted-foreground">
+                Cliente
+              </span>
+              <SearchableSelect
+                items={clientsForMonth}
+                value={clientFilter}
+                onValueChange={handleClientFilterChange}
+                getLabel={(c) => c.legalName}
+                getValue={(c) => c.id}
+                placeholder="Todos los clientes"
+                searchPlaceholder="Buscar cliente..."
+                emptyText="Sin clientes con OT este mes"
+                allowClear
+                clearLabel="Todos los clientes"
+                className="h-8 text-xs"
+              />
+            </div>
+            <div className="w-full space-y-1 sm:w-[200px]">
+              <span className="block text-[10px] font-bold uppercase tracking-wide text-muted-foreground">
+                Tipo de servicio
+              </span>
+              <SearchableSelect
+                items={serviceTypesForMonth}
+                value={serviceTypeFilter}
+                onValueChange={setServiceTypeFilter}
+                getLabel={(s) => `${s.name} (${s.code})`}
+                getValue={(s) => s.id}
+                placeholder="Todos los servicios"
+                searchPlaceholder="Buscar tipo de servicio..."
+                emptyText="Sin tipos de servicio este mes"
+                allowClear
+                clearLabel="Todos los servicios"
+                className="h-8 text-xs"
+              />
+            </div>
+            {(clientFilter || serviceTypeFilter) && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setClientFilter("");
+                  setServiceTypeFilter("");
+                }}
+                className="h-8 gap-1.5 text-xs text-muted-foreground"
+              >
+                <X className="size-3.5" />
+                Limpiar filtros
+              </Button>
+            )}
+          </div>
+
+          {/* Cabecera de días */}
+          <div className="grid grid-cols-7 gap-1">
+            {WEEKDAYS.map((w) => (
+              <div
+                key={w}
+                className="py-1 text-center text-[10px] font-bold uppercase tracking-wide text-muted-foreground"
+              >
+                {w}
+              </div>
+            ))}
+          </div>
+
+          {/* Celdas */}
+          <div className="mt-1 grid grid-cols-7 gap-1">
+            {calCells.map((cell, i) => {
+              if (!cell) {
+                return <div key={`empty-${i}`} className="min-h-[110px] rounded-lg border border-border/60 bg-muted/20" />;
+              }
+              const iso = toISO(cell.date);
+              const dayWOs = woByDayKey.get(iso) ?? [];
+              const isToday = iso === todayKey;
+              const visible = dayWOs.slice(0, 3);
+              const extraCount = dayWOs.length - visible.length;
+              return (
+                <div
+                  key={iso}
+                  onClick={() =>
+                    setViewingDay({
+                      iso,
+                      label: cell.date.toLocaleDateString("es-PE", {
+                        day: "numeric",
+                        month: "long",
+                        year: "numeric",
+                      }),
+                    })
+                  }
+                  className={`flex min-h-[110px] cursor-pointer flex-col rounded-lg border p-1 transition-colors ${
+                    isToday
+                      ? "border-[#0066CC] bg-[#0066CC]/5"
+                      : "border-border bg-background hover:border-[#0066CC]/40"
+                  }`}
+                >
+                  <div className="flex items-center justify-between px-1 pt-0.5">
+                    <span
+                      className={`flex size-5 items-center justify-center rounded-full text-[11px] font-bold ${
+                        isToday ? "bg-[#0066CC] text-white" : "text-foreground"
+                      }`}
+                    >
+                      {cell.day}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openCreate(cell.date);
+                      }}
+                      className="rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-[#0066CC]"
+                      title={`Nueva OT el ${cell.date.toLocaleDateString("es-PE")}`}
+                    >
+                      <Plus className="size-3" />
+                    </button>
+                  </div>
+
+                  <div className="mt-1 flex flex-1 flex-col gap-1 overflow-hidden">
+                    {visible.map((wo) => {
+                      const status = wo.status || "PENDING";
+                      const style = STATUS_STYLES[status] || STATUS_STYLES.PENDING;
+                      return (
+                        <button
+                          key={wo.id}
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setViewingWorkOrder(wo);
+                          }}
+                           title={`${wo.otNumber} — ${typeLabelOf(wo.serviceTypeId)}`}
+                          className={`flex w-full items-center gap-1 rounded border px-1.5 py-0.5 text-left text-[9px] font-semibold leading-tight transition-opacity hover:opacity-80 ${style}`}
+                        >
+                          <Clock className="size-2.5 shrink-0" />
+                          <span className="font-mono truncate">{wo.otNumber}</span>
+                        </button>
+                      );
+                    })}
+                    {extraCount > 0 && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setViewingDay({ iso, label: cell.date.toLocaleDateString("es-PE", { day: "numeric", month: "long", year: "numeric" }) });
+                        }}
+                        className="w-full rounded px-1.5 py-0.5 text-left text-[9px] font-bold text-muted-foreground hover:text-[#0066CC]"
+                      >
+                        +{extraCount} más
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        </div>
+        <div className={view === "list" ? "" : "md:hidden"}>
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setFiltersOpen((o) => !o)}
+              className="h-8 gap-1.5 text-xs font-semibold"
+            >
+              <SlidersHorizontal className="size-3.5" />
+              {filtersOpen ? "Ocultar filtros" : "Mostrar filtros"}
+              {activeFilterCount > 0 && (
+                <span className="inline-flex size-4 items-center justify-center rounded-full bg-[#0066CC] text-[10px] font-bold text-white">
+                  {activeFilterCount}
+                </span>
+              )}
+            </Button>
+          </div>
+
+          {filtersOpen && (
+            <div className="space-y-3 rounded-xl border border-border bg-card p-3 shadow-xs">
+              {/* Rango / tiempo */}
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="w-full text-[10px] font-bold uppercase tracking-wide text-muted-foreground sm:w-auto">
+                  Rango
+                </span>
+                <Button
+                  variant={weekFilter ? "default" : "outline"}
+                  size="sm"
+                  onClick={toggleWeekFilter}
+                  className={`text-xs h-8 ${weekFilter ? "bg-[#0066CC] text-white font-semibold" : ""}`}
+                >
+                  Esta semana
+                </Button>
+                <div className="w-44">
+                  <DatePicker
+                    value={dayFilter}
+                    onChange={handleDayFilterChange}
+                    className="text-xs"
+                    placeholder="Día específico"
+                  />
+                </div>
+              </div>
+
+              {/* Cliente y centro de costo encadenados */}
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-1.5">
+                  <span className="block text-[10px] font-bold uppercase tracking-wide text-muted-foreground">
+                    Cliente
+                  </span>
+                  <SearchableSelect
+                    items={formData.clients}
+                    value={clientFilter}
+                    onValueChange={handleClientFilterChange}
+                    getLabel={(c) => c.legalName}
+                    getValue={(c) => c.id}
+                    placeholder="Todos los clientes"
+                    searchPlaceholder="Buscar cliente..."
+                    emptyText="Sin clientes"
+                    allowClear
+                    clearLabel="Todos los clientes"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <span className="block text-[10px] font-bold uppercase tracking-wide text-muted-foreground">
+                    Centro de costo
+                  </span>
+                  <SearchableSelect
+                    items={clientCostCenters}
+                    value={costCenterFilter}
+                    onValueChange={setCostCenterFilter}
+                    getLabel={(cc) => `${cc.name}${clientFilter ? "" : ` — ${cc.client_name}`}`}
+                    getValue={(cc) => cc.id}
+                    getKeywords={(cc) => cc.client_name}
+                    placeholder={clientFilter ? "Todas las sedes del cliente" : "Todas las sedes"}
+                    searchPlaceholder="Buscar sede..."
+                    emptyText="Sin sedes"
+                    allowClear
+                    clearLabel={clientFilter ? "Todas las sedes del cliente" : "Todas las sedes"}
+                  />
+                </div>
+              </div>
+
+              {/* Tipo de servicio */}
+              <div className="space-y-1.5">
+                <span className="block text-[10px] font-bold uppercase tracking-wide text-muted-foreground">
+                  Tipo de servicio
+                </span>
+                <SearchableSelect
+                  items={formData.serviceTypes}
+                  value={serviceTypeFilter}
+                  onValueChange={setServiceTypeFilter}
+                  getLabel={(s) => `${s.name} (${s.code})`}
+                  getValue={(s) => s.id}
+                  placeholder="Todos los tipos"
+                  searchPlaceholder="Buscar tipo de servicio..."
+                  emptyText="Sin tipos"
+                  allowClear
+                  clearLabel="Todos los tipos"
+                />
+              </div>
+
+              {/* Línea de servicio */}
+              <div className="space-y-1.5">
+                <span className="block text-[10px] font-bold uppercase tracking-wide text-muted-foreground">
+                  Línea
+                </span>
+                <SearchableSelect
+                  items={SCOPE_FILTER_OPTIONS}
+                  value={scopeFilter}
+                  onValueChange={setScopeFilter}
+                  getLabel={(s) => s.name}
+                  getValue={(s) => s.id}
+                  placeholder="Ascensores y servicios generales"
+                  searchPlaceholder="Buscar..."
+                  emptyText="Sin opciones"
+                  allowClear
+                  clearLabel="Ascensores y servicios generales"
+                />
+              </div>
+
+              <div className="flex justify-end">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={clearListFilters}
+                  disabled={activeFilterCount === 0}
+                  className="gap-1.5 text-xs"
+                >
+                  <X className="size-3.5" />
+                  Limpiar filtros
+                </Button>
+              </div>
+            </div>
+          )}
+
+          <DataTable
+            columns={columns}
+            data={listWorkOrders}
+            searchPlaceholder="Buscar por N° OT, cliente, centro de costo o técnico..."
+          />
+        </div>
+        </div>
+
+      {/* Dialog: Crear Orden de Trabajo */}
+      <Dialog open={isCreateOpen} onOpenChange={setIsCreateOpen}>
+        <DialogContent className="bg-card border-border sm:max-w-[540px] text-foreground shadow-lg max-h-[90dvh] overflow-y-auto overscroll-contain pr-3">
+          <DialogHeader>
+            <DialogTitle className="text-base font-bold flex items-center gap-2">
+              <Plus className="size-4 text-[#0066CC]" />
+              Nueva Orden de Trabajo
+            </DialogTitle>
+            <DialogDescription className="text-xs text-muted-foreground">
+              Programa un mantenimiento o atención técnica. El número de OT se genera automáticamente.
+            </DialogDescription>
+          </DialogHeader>
+
+          <Form {...form}>
+            <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-4 pt-2">
+              <div className="grid grid-cols-2 gap-3">
+                <FormField
+                  control={form.control}
+                  name="scheduledDate"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel className="text-xs font-semibold">Fecha Programada</FormLabel>
+                      <FormControl>
+                        <DatePicker
+                          value={field.value ?? ""}
+                          onChange={(v) => handleDateChange(v)}
+                          className="text-xs"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={form.control}
+                  name="scheduledTime"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel className="text-xs font-semibold">Hora Programada</FormLabel>
+                      <FormControl>
+                        <TimePicker
+                          value={field.value ?? ""}
+                          onChange={(v) => field.onChange(v)}
+                          className="text-xs"
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+              <FormItem>
+                <FormLabel className="text-xs font-semibold">N° de OT (se asigna al guardar)</FormLabel>
+                <FormControl>
+                  <Input
+                    readOnly
+                    value={otPreview}
+                    placeholder="OT-AAAA-MM-XXXXXX"
+                    className="bg-muted/40 border-border text-xs font-mono"
+                  />
+                </FormControl>
+              </FormItem>
+
+              <FormField
+                control={form.control}
+                name="serviceTypeId"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel className="text-xs font-semibold">Tipo de Servicio</FormLabel>
+                    <FormControl>
+                      <Select
+                        value={field.value}
+                          onValueChange={(v) => {
+                            field.onChange(v ?? "");
+                            form.setValue("elevatorUnityIds", []);
+                            form.clearErrors("elevatorUnityIds");
+                            // Servicios generales: la OT lista servicios en vez de equipos.
+                            form.setValue(
+                              "services",
+                              v && serviceTypeMap.get(v)?.serviceScope === "GENERAL"
+                                ? [emptyServiceItem(v)]
+                                : []
+                            );
+                            if (v && (serviceTypeMap.get(v)?.category === "EMERGENCIA" || serviceTypeMap.get(v)?.code.startsWith("EMER"))) {
+                              const now = new Date();
+                              form.setValue("scheduledDate", toISO(now));
+                              form.setValue("scheduledTime", `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`);
+                              form.setValue("priority", "EMERGENCY");
+                            }
+                        }}
+                      >
+                        <SelectTrigger className="w-full bg-background border-border text-xs focus-visible:ring-1 focus-visible:ring-[#0066CC]">
+                          <SelectValue placeholder="Selecciona el tipo de servicio">
+                            {selectedServiceType && (
+                              <>
+                                {selectedServiceType.name}
+                                <span className="font-mono text-muted-foreground">
+                                  ({selectedServiceType.code})
+                                </span>
+                              </>
+                            )}
+                          </SelectValue>
+                        </SelectTrigger>
+                        <SelectContent>
+                          {CATEGORY_ORDER.map((cat) => {
+                            const items = formData.serviceTypes.filter((st) => st.category === cat && st.serviceScope !== "GENERAL");
+                            if (items.length === 0) return null;
+                            return (
+                              <SelectGroup key={cat}>
+                                <SelectLabel>{CATEGORY_LABELS[cat] ?? cat}</SelectLabel>
+                                {items.map((st) => (
+                                  <SelectItem key={st.id} value={st.id}>
+                                    {st.name}
+                                    <span className="font-mono text-muted-foreground">{st.code}</span>
+                                  </SelectItem>
+                                ))}
+                              </SelectGroup>
+                            );
+                          })}
+                          {generalServiceTypes.length > 0 && (
+                            <SelectGroup>
+                              <SelectLabel>Servicios Generales</SelectLabel>
+                              {generalServiceTypes.map((st) => (
+                                <SelectItem key={st.id} value={st.id}>
+                                  {st.name}
+                                  <span className="font-mono text-muted-foreground">{st.code}</span>
+                                </SelectItem>
+                              ))}
+                            </SelectGroup>
+                          )}
+                          {formData.serviceTypes.length === 0 && (
+                            <div className="px-2 py-6 text-center text-xs text-muted-foreground">
+                              No hay tipos de servicio activos
+                            </div>
+                          )}
+                        </SelectContent>
+                      </Select>
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              {isEmergency && (
+                <div className="flex items-start gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-300">
+                  <Info className="size-3.5 mt-0.5 shrink-0" />
+                  <span>Emergencia: se creará inmediatamente y debe atenderse según el SLA del tipo de servicio.</span>
+                </div>
+              )}
+
+              {isPreventive && (
+                <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                  <Info className="size-3.5 mt-0.5 shrink-0" />
+                  <span>
+                    Preventivo: si el equipo ya tiene un mantenimiento preventivo programado dentro de
+                    este mes, no se permitirá registrarlo de nuevo.
+                  </span>
+                </div>
+              )}
+
+              {(isCorrective || isEmergency) && (
+                <FormField
+                  control={form.control}
+                  name="description"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel className="text-xs font-semibold">Descripción del problema</FormLabel>
+                      <FormControl>
+                        <Textarea {...field} value={field.value ?? ""} minLength={10} placeholder="Describe el problema (mínimo 10 caracteres)" className="text-xs min-h-20" />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              )}
+
+              <FormField
+                control={form.control}
+                name="clientId"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel className="text-xs font-semibold">Cliente</FormLabel>
+                    <FormControl>
+                      <SearchableSelect
+                        items={formData.clients}
+                        value={field.value ?? ""}
+                        onValueChange={(v) => {
+                          field.onChange(v);
+                          form.setValue("costCenterId", "");
+                          form.setValue("elevatorUnityIds", []);
+                          form.setValue("quotationId", "");
+                        }}
+                        getValue={(c) => c.id}
+                        getLabel={(c) => c.legalName}
+                        placeholder="Selecciona el cliente"
+                        searchPlaceholder="Buscar cliente..."
+                        emptyText="No hay clientes registrados"
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="costCenterId"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel className="text-xs font-semibold">Centro de Costo</FormLabel>
+                    <FormControl>
+                      <SearchableSelect
+                        items={costCentersByClient}
+                        value={field.value ?? ""}
+                        onValueChange={(v) => {
+                          field.onChange(v);
+                          form.setValue("quotationId", "");
+                        }}
+                        getValue={(cc) => cc.id}
+                        getLabel={(cc) => cc.name}
+                        getKeywords={(cc) => cc.client_name}
+                        placeholder="Selecciona el centro de costo"
+                        searchPlaceholder="Buscar centro de costo..."
+                        emptyText={
+                          selectedClientId
+                            ? "Este cliente no tiene centros de costo"
+                            : "Elige un cliente primero"
+                        }
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="quotationId"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel className="text-xs font-semibold">Cotización</FormLabel>
+                    <FormControl>
+                      <SearchableSelect
+                        items={quotationsForSelection}
+                        value={field.value ?? ""}
+                        onValueChange={(v) => field.onChange(v)}
+                        getValue={(q) => q.id}
+                        getLabel={(q) => q.quotationNumber}
+                        getKeywords={(q) => [q.statusLabel, formatQuotationTotal(q.total), formatQuotationDate(q.issueDate)].filter(Boolean).join(" ")}
+                        renderItem={(q) => (
+                          <span className="flex w-full items-center justify-between gap-2">
+                            <span className="min-w-0 truncate font-mono font-semibold">{q.quotationNumber}</span>
+                            <span className="flex shrink-0 items-center gap-1.5 text-[9px] text-muted-foreground">
+                              <span>{formatQuotationTotal(q.total)}</span>
+                              <span className="rounded-full border px-1.5 py-0.5">{q.statusLabel ?? "—"}</span>
+                            </span>
+                          </span>
+                        )}
+                        allowClear
+                        clearLabel="Sin cotización"
+                        disabled={!selectedClientId || !selectedCostCenterId}
+                        placeholder={
+                          selectedClientId && selectedCostCenterId
+                            ? "Vincular una cotización (opcional)"
+                            : "Elige cliente y centro de costo primero"
+                        }
+                        searchPlaceholder="Buscar por código..."
+                        emptyText="El cliente y el centro de costo seleccionados no tienen cotizaciones"
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <div className="grid grid-cols-2 gap-3">
+                <FormField
+                  control={form.control}
+                  name="technicianId"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel className="text-xs font-semibold">Técnico</FormLabel>
+                      <FormControl>
+                        <SearchableSelect items={formData.technicians} value={field.value ?? ""} onValueChange={field.onChange} getValue={(t) => t.id} getLabel={(t) => t.fullName} getKeywords={(t) => t.providerType} renderItem={(t) => <span className="flex w-full items-center justify-between gap-2"><span>{t.fullName}</span><span className="rounded-full border px-1.5 py-0.5 text-[9px]">{t.providerType === "EXTERNAL" ? "Externo" : "ACELERA · Interno"}</span></span>} placeholder="Buscar técnico..." searchPlaceholder="Buscar técnico..." emptyText="No hay técnicos disponibles" />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={form.control}
+                  name="priority"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel className="text-xs font-semibold">Prioridad</FormLabel>
+                      <FormControl>
+                        <Select value={field.value} onValueChange={(v) => field.onChange(v ?? "NORMAL")}>
+                          <SelectTrigger className="w-full bg-background border-border text-xs focus-visible:ring-1 focus-visible:ring-[#0066CC]">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {["HIGH", "NORMAL", "LOW"].map((p) => (
+                              <SelectItem key={p} value={p}>
+                                {PRIORITY_LABELS[p] ?? p}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <FormField control={form.control} name="supportingTechnicians" render={({ field }) => <FormItem><FormLabel className="text-xs font-semibold">Técnicos de apoyo</FormLabel><FormControl><Input {...field} value={field.value ?? ""} placeholder="Si deseas colocar técnicos adicionales" className="text-xs" /></FormControl></FormItem>} />
+                <FormField control={form.control} name="estimatedDurationMins" render={({ field }) => <FormItem><FormLabel className="text-xs font-semibold">Duración estimada por {isGeneral ? "Servicio" : "Equipo"} (min)</FormLabel><FormControl><Input type="number" min="1" {...field} value={field.value ?? ""} onChange={(e) => field.onChange(e.target.value ? Number(e.target.value) : null)} className="text-xs" /></FormControl></FormItem>} />
+              </div>
+
+              {isGeneral && (
+                <WorkOrderServicesField
+                  form={form}
+                  generalServiceTypes={generalServiceTypes}
+                  defaultServiceTypeId={selectedServiceType?.id ?? ""}
+                />
+              )}
+
+              {!isGeneral && <FormField
+                control={form.control}
+                name="elevatorUnityIds"
+                render={({ field }) => (
+                  <FormItem>
+                     <FormLabel className="text-xs font-semibold">
+                       {isPreventive ? "Equipos a mantener" : "Equipo afectado"}
+                     </FormLabel>
+                    <FormControl>
+                      <div className="max-h-40 space-y-1.5 overflow-y-auto pr-1">
+                        {!selectedCostCenterId ? (
+                          <div className="rounded-md border border-dashed border-border px-3 py-5 text-center text-xs text-muted-foreground">
+                            Primero selecciona un centro de costo para ver sus equipos.
+                          </div>
+                        ) : equipmentForCostCenter.length === 0 ? (
+                          <div className="rounded-md border border-dashed border-border px-3 py-5 text-center text-xs text-muted-foreground">
+                            No hay equipos en el centro de costo seleccionado.
+                          </div>
+                        ) : (
+                          equipmentForCostCenter.map((eq) => (
+                            <div
+                              key={eq.id}
+                              className="flex items-center gap-2.5 rounded-md border border-border px-3 py-1.5"
+                            >
+                              <Checkbox
+                                id={`wo-eq-${eq.id}`}
+                                checked={field.value.includes(eq.id)}
+                                 onCheckedChange={(checked) => {
+                                  field.onChange(
+                                    checked
+                                      ? isPreventive ? [...field.value, eq.id] : [eq.id]
+                                      : field.value.filter((x) => x !== eq.id)
+                                  );
+                                }}
+                              />
+                              <Label
+                                htmlFor={`wo-eq-${eq.id}`}
+                                className="text-xs font-normal cursor-pointer"
+                              >
+                                <span className="font-mono font-semibold text-foreground">
+                                  {eq.internalCode}
+                                </span>{" "}
+                                — {eq.name}
+                              </Label>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />}
+
+              <DialogFooter className="pt-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setIsCreateOpen(false)}
+                  className="text-xs border-border"
+                >
+                  Cancelar
+                </Button>
+                <Button
+                  type="submit"
+                  size="sm"
+                  disabled={isPending}
+                  className="text-xs bg-[#0066CC] hover:bg-[#0055AA] text-white font-semibold gap-2"
+                >
+                  {isPending && <Loader2 className="size-3.5 animate-spin" />}
+                  Crear OT
+                </Button>
+              </DialogFooter>
+            </form>
+          </Form>
+        </DialogContent>
+      </Dialog>
+
+      {/* Sheet lateral: Detalle del día */}
+      <Sheet
+        open={!!viewingDay}
+        onOpenChange={(o) => {
+          if (!o) setViewingDay(null);
+        }}
+      >
+        <SheetContent className="w-full max-w-md bg-card border-border text-foreground">
+          <SheetHeader>
+            <SheetTitle className="text-base font-bold flex items-center gap-2">
+              <CalendarClock className="size-4 text-[#0066CC]" />
+              {viewingDay?.label}
+            </SheetTitle>
+            <SheetDescription className="text-xs text-muted-foreground">
+              {viewingDayList.length}{" "}
+              {viewingDayList.length === 1 ? "orden de trabajo" : "órdenes de trabajo"} programadas
+              este día.
+            </SheetDescription>
+          </SheetHeader>
+
+          <div className="flex-1 space-y-2 overflow-y-auto pr-1">
+            {viewingDayList.length === 0 && (
+              <div className="rounded-md border border-dashed border-border px-3 py-5 text-center text-xs text-muted-foreground">
+                Sin órdenes de trabajo este día.
+              </div>
+            )}
+            {viewingDayList.map((wo) => {
+              const status = wo.status || "PENDING";
+              const statusStyle = STATUS_STYLES[status] || STATUS_STYLES.PENDING;
+              const priority = wo.priority || "NORMAL";
+              const priorityStyle = PRIORITY_STYLES[priority] || PRIORITY_STYLES.NORMAL;
+              const equipmentCount = elevatorsByWorkOrder.get(wo.id) ?? 0;
+              return (
+                <div key={wo.id} className="rounded-lg border border-border bg-card p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-mono text-xs font-bold text-foreground">
+                      {wo.otNumber}
+                    </span>
+                    <span
+                      className={`inline-flex px-1.5 py-0.5 rounded-full text-[9px] font-bold border ${statusStyle}`}
+                    >
+                      {STATUS_LABELS[status] ?? status}
+                    </span>
+                  </div>
+
+                  <p className="mt-1.5 flex flex-wrap items-center gap-1 text-xs font-semibold text-foreground">
+                    {isGeneralOrder(wo.serviceTypeId) && (
+                      <span className={GENERAL_BADGE_CLASS}>General</span>
+                    )}
+                    {typeLabelOf(wo.serviceTypeId)}
+                  </p>
+
+                  <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 text-[11px] text-muted-foreground">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <Building2 className="size-3 shrink-0 text-[#0066CC]" />
+                      <span title={wo.client_name ?? ""} className="truncate">
+                        {wo.client_name ?? "—"}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <User2 className="size-3 shrink-0 text-[#0066CC]" />
+                      <span className="truncate">{wo.technician_name ?? "Sin técnico"}</span>
+                    </div>
+                    <div className="flex items-center gap-1.5 min-w-0 col-span-2">
+                      <Building2 className="size-3 shrink-0 text-muted-foreground/50" />
+                      <span className="truncate">{wo.cost_center_name}</span>
+                    </div>
+                  </div>
+
+                  <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                    <span
+                      className={`inline-flex px-1.5 py-0.5 rounded-full text-[9px] font-bold border ${priorityStyle}`}
+                    >
+                      Prioridad {PRIORITY_LABELS[priority] ?? priority}
+                    </span>
+                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-bold border border-border bg-muted/40 text-muted-foreground">
+                      <Cpu className="size-2.5" />
+                      {equipmentCount} {equipmentCount === 1 ? "equipo" : "equipos"}
+                    </span>
+                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-bold border border-border bg-muted/40 text-muted-foreground">
+                      <CalendarClock className="size-2.5" />
+                      {formatScheduled(wo.scheduledDate, wo.scheduledTime ?? null)}
+                    </span>
+                  </div>
+
+                  <Button
+                    variant="outline"
+                    size="xs"
+                    onClick={() => {
+                      setViewingDay(null);
+                      setViewingWorkOrder(wo);
+                    }}
+                    className="mt-3 h-7 w-full px-2.5 text-xs font-semibold text-[#0066CC] dark:text-blue-400 border-[#0066CC]/30 hover:bg-[#0066CC]/10 gap-1.5"
+                  >
+                    <Eye className="size-3" />
+                    Ver detalle completo
+                  </Button>
+                </div>
+              );
+            })}
+          </div>
+
+          {viewingDay && (
+            <SheetFooter className="pt-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setViewingDay(null);
+                  openCreate(
+                    (() => {
+                      const [y, m, d] = viewingDay.iso.split("-").map(Number);
+                      return new Date(y, m - 1, d);
+                    })()
+                  );
+                }}
+                className="w-full text-xs border-border"
+              >
+                <Plus className="size-3.5" />
+                Nueva OT este día
+              </Button>
+            </SheetFooter>
+          )}
+        </SheetContent>
+      </Sheet>
+
+      {/* Dialog: Detalle de la OT */}
+      {viewingWorkOrder && (
+        <WorkOrderDetail
+          workOrder={viewingWorkOrder}
+          workOrderElevators={initialWorkOrderElevators.filter(
+            (e) => e.workOrderId === viewingWorkOrder.id
+          )}
+          workOrderServices={initialWorkOrderServices.filter(
+            (s) => s.workOrderId === viewingWorkOrder.id
+          )}
+          serviceTypes={formData.serviceTypes}
+          onClose={() => setViewingWorkOrder(null)}
+        />
+      )}
+
+      {/* Dialog: Confirmar Eliminación */}
+      <Dialog
+        open={!!deletingWorkOrder}
+        onOpenChange={(o) => !o && setDeletingWorkOrder(null)}
+      >
+        <DialogContent className="bg-card border-border sm:max-w-[400px] text-foreground shadow-lg">
+          <DialogHeader>
+            <DialogTitle className="text-base font-bold flex items-center gap-2 text-red-600 dark:text-red-400">
+              <Trash2 className="size-4 text-red-600 dark:text-red-400" />
+              Eliminar OT
+            </DialogTitle>
+            <DialogDescription className="text-xs text-muted-foreground">
+              ¿Confirmas la eliminación de la orden de trabajo{" "}
+              <strong className="text-foreground font-mono">{deletingWorkOrder?.otNumber}</strong>?
+            </DialogDescription>
+          </DialogHeader>
+
+          <DialogFooter className="pt-3 gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setDeletingWorkOrder(null)}
+              className="text-xs border-border"
+            >
+              Cancelar
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              disabled={isPending}
+              onClick={handleDeleteConfirm}
+              className="text-xs bg-red-600 hover:bg-red-700 text-white font-semibold gap-2"
+            >
+              {isPending && <Loader2 className="size-3.5 animate-spin" />}
+              Eliminar Definitivamente
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

@@ -1,0 +1,36 @@
+import { getUsers, getAllRoles, getSupplierOptions } from "@/features/users/actions";
+import { ensureDefaultRoles } from "@/features/users/queries";
+import { UsersTable } from "@/features/users/components/users-table";
+import { Users } from "lucide-react";
+import { requirePageAccess } from "@/features/auth/guard";
+
+export const dynamic = "force-dynamic";
+
+export default async function UsersPage() {
+  await requirePageAccess("users:read");
+  await ensureDefaultRoles();
+  const [users, roles, suppliers] = await Promise.all([
+    getUsers(),
+    getAllRoles(),
+    getSupplierOptions(),
+  ]);
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-lg font-bold tracking-tight text-foreground flex items-center gap-2">
+            <Users className="size-5 text-[#0066CC]" />
+            Personal y Usuarios
+          </h1>
+          <p className="text-xs text-muted-foreground mt-1">
+            Administra colaboradores y sus accesos al sistema. Las contraseñas se protegen con
+            Argon2id (m=64MB, t=3, p=4).
+          </p>
+        </div>
+      </div>
+
+      <UsersTable initialUsers={users} roles={roles} suppliers={suppliers} />
+    </div>
+  );
+}

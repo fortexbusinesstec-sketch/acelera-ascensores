@@ -1,0 +1,565 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import {
+  db,
+  contracts,
+  clients,
+  costCenters,
+  serviceTypes,
+  elevatorUnities,
+  contractElevators,
+  maintenanceModules,
+  brands,
+  models,
+  elevatorTypes,
+  ubigeos,
+  type Contract,
+  type ContractElevator,
+} from "@/db/index";
+import { getErrorMessage, isUniqueConstraintError } from "@/lib/errors";
+import { denyUnless, requirePermission } from "@/features/auth/guard";
+import { contractPdfPath } from "@/lib/pdf-paths";
+import { generateUuid } from "@/lib/uuid";
+import { generateDocumentNumber } from "@/lib/document-number";
+import {
+  contractFormSchema,
+  contractElevatorFormSchema,
+  type ContractFormValues,
+  type ContractElevatorFormValues,
+} from "./schema";
+import { eq, asc, desc, isNull, isNotNull, and } from "drizzle-orm";
+import { cancelContractRecords } from "./cancel";
+
+export type ContractWithRelations = Contract & {
+  cost_center_name?: string | null;
+  service_type_name?: string | null;
+};
+
+const toUnix = (iso: string): number => {
+  const [year, month, day] = iso.split("-").map(Number);
+  return Math.floor(Date.UTC(year, month - 1, day) / 1000);
+};
+
+function buildContractNumber(): string {
+  return generateDocumentNumber("CT", String(new Date().getFullYear()));
+}
+
+async function nextContractNumber(): Promise<string> {
+  return buildContractNumber();
+}
+
+/**
+ * Lo que el navegador recibe como `finalPdfUrl`: la ruta de la app que valida
+ * la sesión y entrega el PDF, nunca la URL del bucket.
+ */
+function clientFinalPdfUrl(row: {
+  id: string;
+  finalPdfUrl: string | null;
+  finalPdfKey: string | null;
+}): string | null {
+  return row.finalPdfKey || row.finalPdfUrl ? contractPdfPath(row.id) : null;
+}
+
+export async function getContracts(): Promise<ContractWithRelations[]> {
+  await requirePermission("contracts:read", "maintenance:read");
+  try {
+    const rows = await db
+      .select({
+        id: contracts.id,
+        contractNumber: contracts.contractNumber,
+        costCenterId: contracts.costCenterId,
+        status: contracts.status,
+        serviceTypeId: contracts.serviceTypeId,
+        startDate: contracts.startDate,
+        endDate: contracts.endDate,
+        autoRenewal: contracts.autoRenewal,
+        noticePeriodDays: contracts.noticePeriodDays,
+        currency: contracts.currency,
+        baseAmount: contracts.baseAmount,
+        includesIgv: contracts.includesIgv,
+        paymentTermsDays: contracts.paymentTermsDays,
+        inflationAdjustment: contracts.inflationAdjustment,
+        slaEntrapmentMins: contracts.slaEntrapmentMins,
+        slaMechanicalFailureMins: contracts.slaMechanicalFailureMins,
+        clientSignerName: contracts.clientSignerName,
+        clientSignerDocument: contracts.clientSignerDocument,
+        signatureDate: contracts.signatureDate,
+        documentStatus: contracts.documentStatus,
+        documentOverrides: contracts.documentOverrides,
+        finalPdfUrl: contracts.finalPdfUrl,
+        finalPdfKey: contracts.finalPdfKey,
+        createdAt: contracts.createdAt,
+        deletedAt: contracts.deletedAt,
+        cost_center_name: costCenters.name,
+        service_type_name: serviceTypes.name,
+      })
+      .from(contracts)
+      .innerJoin(costCenters, eq(contracts.costCenterId, costCenters.id))
+      .innerJoin(serviceTypes, eq(contracts.serviceTypeId, serviceTypes.id))
+      .orderBy(desc(contracts.createdAt));
+    return rows.map((row) => ({ ...row, finalPdfUrl: clientFinalPdfUrl(row) }));
+  } catch (error) {
+    console.error("Error al obtener contratos:", error);
+    return [];
+  }
+}
+
+export async function createContract(data: ContractFormValues) {
+  const denied = await denyUnless("contracts:write");
+  if (denied) return denied;
+  try {
+    const validated = contractFormSchema.parse(data);
+    const contractId = generateUuid();
+    const insertContract = (contractNumber: string) =>
+      db.insert(contracts).values({
+        id: contractId,
+        contractNumber,
+        costCenterId: validated.costCenterId,
+        status: validated.status || "ACTIVE",
+        serviceTypeId: validated.serviceTypeId,
+        startDate: toUnix(validated.startDate),
+        endDate: validated.endDate ? toUnix(validated.endDate) : null,
+        autoRenewal: validated.autoRenewal,
+        noticePeriodDays: validated.noticePeriodDays ?? 30,
+        currency: validated.currency || "PEN",
+        baseAmount: validated.baseAmount,
+        includesIgv: validated.includesIgv,
+        paymentTermsDays: validated.paymentTermsDays ?? 5,
+        inflationAdjustment: validated.inflationAdjustment,
+        slaEntrapmentMins: validated.slaEntrapmentMins ?? 45,
+        slaMechanicalFailureMins: validated.slaMechanicalFailureMins ?? 180,
+      });
+
+    // Número aleatorio con reintento ante colisión del índice UNIQUE.
+    const maxAttempts = 5;
+    let contractNumber = "";
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      contractNumber = await nextContractNumber();
+      try {
+        await insertContract(contractNumber);
+        break;
+      } catch (error) {
+        if (isUniqueConstraintError(error) && attempt < maxAttempts) continue;
+        throw error;
+      }
+    }
+
+    revalidatePath("/contracts");
+    return { success: true, message: `Contrato ${contractNumber} registrado correctamente` };
+  } catch (error) {
+    console.error("Error al crear contrato:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function updateContract(id: string, data: Partial<ContractFormValues>) {
+  const denied = await denyUnless("contracts:write");
+  if (denied) return denied;
+  try {
+    const updateData: {
+      costCenterId?: string;
+      status?: string;
+      serviceTypeId?: string;
+      startDate?: number;
+      endDate?: number | null;
+      autoRenewal?: boolean;
+      noticePeriodDays?: number;
+      currency?: string;
+      baseAmount?: number;
+      includesIgv?: boolean;
+      paymentTermsDays?: number;
+      inflationAdjustment?: boolean;
+      slaEntrapmentMins?: number;
+      slaMechanicalFailureMins?: number;
+    } = {};
+    if (data.costCenterId) updateData.costCenterId = data.costCenterId;
+    if (data.status) updateData.status = data.status;
+    if (data.serviceTypeId) updateData.serviceTypeId = data.serviceTypeId;
+    if (data.startDate) updateData.startDate = toUnix(data.startDate);
+    if (data.endDate !== undefined) updateData.endDate = data.endDate ? toUnix(data.endDate) : null;
+    if (data.autoRenewal !== undefined) updateData.autoRenewal = data.autoRenewal;
+    if (data.noticePeriodDays !== undefined) updateData.noticePeriodDays = data.noticePeriodDays;
+    if (data.currency) updateData.currency = data.currency;
+    if (data.baseAmount !== undefined) updateData.baseAmount = data.baseAmount;
+    if (data.includesIgv !== undefined) updateData.includesIgv = data.includesIgv;
+    if (data.paymentTermsDays !== undefined) updateData.paymentTermsDays = data.paymentTermsDays;
+    if (data.inflationAdjustment !== undefined)
+      updateData.inflationAdjustment = data.inflationAdjustment;
+    if (data.slaEntrapmentMins !== undefined) updateData.slaEntrapmentMins = data.slaEntrapmentMins;
+    if (data.slaMechanicalFailureMins !== undefined)
+      updateData.slaMechanicalFailureMins = data.slaMechanicalFailureMins;
+
+    await db.update(contracts).set(updateData).where(eq(contracts.id, id));
+
+    revalidatePath("/contracts");
+    return { success: true, message: "Contrato actualizado exitosamente" };
+  } catch (error) {
+    console.error("Error al actualizar contrato:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function deleteContract(id: string) {
+  const denied = await denyUnless("contracts:write");
+  if (denied) return denied;
+  try {
+    await db.update(contracts).set({ deletedAt: Math.floor(Date.now() / 1000) }).where(eq(contracts.id, id));
+    revalidatePath("/contracts");
+    return { success: true, message: "Contrato eliminado correctamente" };
+  } catch (error) {
+    console.error("Error al eliminar contrato:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function cancelContract(id: string) {
+  const denied = await denyUnless("contracts:write");
+  if (denied) return denied;
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const { unlinkedElevators: n } = await db.transaction((tx) => cancelContractRecords(tx, id, now));
+
+    revalidatePath("/contracts");
+    revalidatePath("/routes");
+    revalidatePath("/work-orders");
+    return {
+      success: true,
+      message: `Contrato anulado. ${n} ${n === 1 ? "equipo desvinculado" : "equipos desvinculados"}`,
+    };
+  } catch (error) {
+    console.error("Error al anular contrato:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+/**
+ * Mapa contrato -> tiene módulos rotativos.
+ * Permite ocultar la frecuencia de mantenimiento cuando todos los módulos del
+ * contrato son fijos (por ejemplo plataformas, que usan meses absolutos).
+ */
+export async function getContractsWithRotatingModules(): Promise<
+  Record<string, boolean>
+> {
+  await requirePermission("contracts:read");
+  try {
+    const rows = await db
+      .selectDistinct({ contractId: contractElevators.contractId })
+      .from(contractElevators)
+      .innerJoin(
+        elevatorUnities,
+        eq(contractElevators.elevatorUnityId, elevatorUnities.id)
+      )
+      .innerJoin(
+        maintenanceModules,
+        eq(maintenanceModules.elevatorTypeId, elevatorUnities.elevatorTypeId)
+      )
+      .where(
+        and(
+          eq(maintenanceModules.isActive, true),
+          isNotNull(maintenanceModules.monthsOfYear)
+        )
+      );
+
+    return Object.fromEntries(rows.map((row) => [row.contractId, true]));
+  } catch (error) {
+    console.error("Error al revisar módulos rotativos por contrato:", error);
+    return {};
+  }
+}
+
+// ==========================================
+// 2. EQUIPOS DEL CONTRATO (CONTRACT ELEVATORS)
+// ==========================================
+
+/**
+ * ¿El contrato tiene algún módulo rotativo asignado?
+ * La frecuencia de mantenimiento del contrato solo aplica en ese caso.
+ */
+export async function contractHasRotatingModules(
+  contractId: string
+): Promise<boolean> {
+  await requirePermission("contracts:read");
+  try {
+    const rows = await db
+      .select({ id: maintenanceModules.id })
+      .from(contractElevators)
+      .innerJoin(
+        elevatorUnities,
+        eq(contractElevators.elevatorUnityId, elevatorUnities.id)
+      )
+      .innerJoin(
+        maintenanceModules,
+        eq(maintenanceModules.elevatorTypeId, elevatorUnities.elevatorTypeId)
+      )
+      .where(
+        and(
+          eq(contractElevators.contractId, contractId),
+          eq(maintenanceModules.isActive, true),
+          isNotNull(maintenanceModules.monthsOfYear)
+        )
+      )
+      .limit(1);
+    return rows.length > 0;
+  } catch (error) {
+    console.error("Error al revisar módulos rotativos del contrato:", error);
+    // Ante cualquier duda se muestra el campo: la validación real ocurre al
+    // generar la orden de trabajo.
+    return true;
+  }
+}
+
+export type ContractElevatorWithRelations = ContractElevator & {
+  internal_code?: string | null;
+  elevator_name?: string | null;
+  cost_center_name?: string | null;
+  brand_name?: string | null;
+  model_name?: string | null;
+  type_name?: string | null;
+  capacity_persons?: number | null;
+  capacity_kg?: number | null;
+  speed_ms?: number | null;
+  stops?: number | null;
+  floors?: number | null;
+};
+
+export async function getContractElevators(
+  contractId?: string
+): Promise<ContractElevatorWithRelations[]> {
+  await requirePermission("contracts:read", "maintenance:read");
+  try {
+    const query = db
+      .select({
+        id: contractElevators.id,
+        contractId: contractElevators.contractId,
+        elevatorUnityId: contractElevators.elevatorUnityId,
+        frequencyMonths: contractElevators.frequencyMonths,
+        price: contractElevators.price,
+        addedAt: contractElevators.addedAt,
+        internal_code: elevatorUnities.internalCode,
+        elevator_name: elevatorUnities.name,
+        cost_center_name: costCenters.name,
+        brand_name: brands.name,
+        model_name: models.name,
+        type_name: elevatorTypes.name,
+        capacity_persons: elevatorUnities.capacityPersons,
+        capacity_kg: elevatorUnities.capacityKg,
+        speed_ms: elevatorUnities.speedMs,
+        stops: elevatorUnities.stops,
+        floors: elevatorUnities.floors,
+      })
+      .from(contractElevators)
+      .innerJoin(elevatorUnities, eq(contractElevators.elevatorUnityId, elevatorUnities.id))
+      .innerJoin(costCenters, eq(elevatorUnities.costCenterId, costCenters.id))
+      .leftJoin(brands, eq(elevatorUnities.brandId, brands.id))
+      .leftJoin(models, eq(elevatorUnities.modelId, models.id))
+      .leftJoin(elevatorTypes, eq(elevatorUnities.elevatorTypeId, elevatorTypes.id))
+      .orderBy(asc(elevatorUnities.internalCode));
+
+    if (contractId) {
+      return await query.where(eq(contractElevators.contractId, contractId));
+    }
+    return await query;
+  } catch (error) {
+    console.error("Error al obtener equipos del contrato:", error);
+    return [];
+  }
+}
+
+export async function createContractElevator(data: ContractElevatorFormValues) {
+  const denied = await denyUnless("contracts:write");
+  if (denied) return denied;
+  try {
+    const validated = contractElevatorFormSchema.parse(data);
+
+    await db.insert(contractElevators).values({
+      id: generateUuid(),
+      contractId: validated.contractId,
+      elevatorUnityId: validated.elevatorUnityId,
+      frequencyMonths: validated.frequencyMonths || 1,
+      price: validated.price,
+    });
+
+    revalidatePath("/contracts");
+    return { success: true, message: "Equipo asignado al contrato" };
+  } catch (error) {
+    console.error("Error al asignar equipo al contrato:", error);
+    if (getErrorMessage(error).includes("UNIQUE constraint failed")) {
+      return { success: false, error: "El equipo ya está asignado a este contrato." };
+    }
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function updateContractElevator(
+  id: string,
+  data: Partial<ContractElevatorFormValues>
+) {
+  const denied = await denyUnless("contracts:write");
+  if (denied) return denied;
+  try {
+    const updateData: { frequencyMonths?: number; price?: number } = {};
+    if (data.frequencyMonths !== undefined) updateData.frequencyMonths = data.frequencyMonths;
+    if (data.price !== undefined) updateData.price = data.price;
+
+    await db.update(contractElevators).set(updateData).where(eq(contractElevators.id, id));
+
+    revalidatePath("/contracts");
+    return { success: true, message: "Equipo del contrato actualizado" };
+  } catch (error) {
+    console.error("Error al actualizar equipo del contrato:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+export async function deleteContractElevator(id: string) {
+  const denied = await denyUnless("contracts:write");
+  if (denied) return denied;
+  try {
+    await db.delete(contractElevators).where(eq(contractElevators.id, id));
+    revalidatePath("/contracts");
+    return { success: true, message: "Equipo eliminado del contrato" };
+  } catch (error) {
+    console.error("Error al eliminar equipo del contrato:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
+// ==========================================
+// 3. CENTROS DE COSTO PARA EL FORMULARIO
+// ==========================================
+
+export async function getContractCostCenters() {
+  await requirePermission("contracts:read", "maintenance:read");
+  try {
+    const result = await db
+      .select({
+        id: costCenters.id,
+        clientId: costCenters.clientId,
+        name: costCenters.name,
+        address: costCenters.address,
+        client_name: clients.legalName,
+      })
+      .from(costCenters)
+      .innerJoin(clients, eq(costCenters.clientId, clients.id))
+      .where(isNull(costCenters.deletedAt))
+      .orderBy(asc(costCenters.name));
+    return result;
+  } catch (error) {
+    console.error("Error al obtener centros de costo:", error);
+    return [];
+  }
+}
+
+export async function getContractServiceTypes() {
+  await requirePermission("contracts:read");
+  try {
+    return await db
+      .select()
+      .from(serviceTypes)
+      .where(eq(serviceTypes.isActive, true))
+      .orderBy(asc(serviceTypes.name));
+  } catch (error) {
+    console.error("Error al obtener tipos de servicio:", error);
+    return [];
+  }
+}
+
+// ==========================================
+// 4. DETALLE DEL CONTRATO
+// ==========================================
+
+export type ContractDetail = Contract & {
+  cost_center_name: string | null;
+  cost_center_address: string | null;
+  cost_center_district: string | null;
+  service_type_name: string | null;
+  client_legal_name: string | null;
+  elevators: ContractElevatorWithRelations[];
+};
+
+export async function getContractById(id: string): Promise<ContractDetail | null> {
+  await requirePermission("contracts:read");
+  try {
+    const [row] = await db
+      .select({
+        id: contracts.id,
+        contractNumber: contracts.contractNumber,
+        costCenterId: contracts.costCenterId,
+        status: contracts.status,
+        serviceTypeId: contracts.serviceTypeId,
+        startDate: contracts.startDate,
+        endDate: contracts.endDate,
+        autoRenewal: contracts.autoRenewal,
+        noticePeriodDays: contracts.noticePeriodDays,
+        currency: contracts.currency,
+        baseAmount: contracts.baseAmount,
+        includesIgv: contracts.includesIgv,
+        paymentTermsDays: contracts.paymentTermsDays,
+        inflationAdjustment: contracts.inflationAdjustment,
+        slaEntrapmentMins: contracts.slaEntrapmentMins,
+        slaMechanicalFailureMins: contracts.slaMechanicalFailureMins,
+        clientSignerName: contracts.clientSignerName,
+        clientSignerDocument: contracts.clientSignerDocument,
+        signatureDate: contracts.signatureDate,
+        documentStatus: contracts.documentStatus,
+        documentOverrides: contracts.documentOverrides,
+        finalPdfUrl: contracts.finalPdfUrl,
+        finalPdfKey: contracts.finalPdfKey,
+        createdAt: contracts.createdAt,
+        deletedAt: contracts.deletedAt,
+        cost_center_name: costCenters.name,
+        cost_center_address: costCenters.address,
+        cost_center_district: ubigeos.distrito,
+        service_type_name: serviceTypes.name,
+        client_legal_name: clients.legalName,
+      })
+      .from(contracts)
+      .innerJoin(costCenters, eq(contracts.costCenterId, costCenters.id))
+      .leftJoin(ubigeos, eq(costCenters.ubigeoId, ubigeos.id))
+      .innerJoin(serviceTypes, eq(contracts.serviceTypeId, serviceTypes.id))
+      .innerJoin(clients, eq(costCenters.clientId, clients.id))
+      .where(eq(contracts.id, id))
+      .limit(1);
+
+    if (!row) return null;
+
+    const elevators = await getContractElevators(id);
+
+    return { ...row, finalPdfUrl: clientFinalPdfUrl(row), elevators };
+  } catch (error) {
+    console.error("Error al obtener contrato:", error);
+    return null;
+  }
+}
+
+export async function updateContractDocument(
+  id: string,
+  data: {
+    clientSignerName?: string;
+    clientSignerDocument?: string;
+    signatureDate?: number;
+    documentOverrides?: Record<string, unknown>;
+  }
+) {
+  const denied = await denyUnless("contracts:write");
+  if (denied) return denied;
+  try {
+    const updateData: Record<string, unknown> = {};
+    if (data.clientSignerName !== undefined) updateData.clientSignerName = data.clientSignerName;
+    if (data.clientSignerDocument !== undefined) updateData.clientSignerDocument = data.clientSignerDocument;
+    if (data.signatureDate !== undefined) updateData.signatureDate = data.signatureDate;
+    if (data.documentOverrides !== undefined) {
+      updateData.documentOverrides = data.documentOverrides;
+    }
+
+    await db.update(contracts).set(updateData).where(eq(contracts.id, id));
+
+    revalidatePath("/contracts");
+    revalidatePath(`/contracts/${id}`);
+    return { success: true, message: "Documento actualizado" };
+  } catch (error) {
+    console.error("Error al actualizar documento:", error);
+    return { success: false, error: getErrorMessage(error) };
+  }
+}

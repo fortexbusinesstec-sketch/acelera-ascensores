@@ -1,0 +1,245 @@
+"use client";
+
+import { useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { z } from "zod";
+import { toast } from "sonner";
+import { loginAction } from "../actions";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { EmailInput } from "@/components/ui/email-input";
+import { FortexLogo } from "@/components/fortex-logo";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
+import {
+  Mail,
+  Lock,
+  Eye,
+  EyeOff,
+  Loader2,
+  LogIn,
+  ShieldCheck,
+  Building2,
+  Wrench,
+  ChevronRight,
+  AlertTriangle,
+} from "lucide-react";
+
+const loginSchema = z.object({
+  email: z.string().email("Ingresa un correo electrónico válido"),
+  password: z.string().min(1, "Ingresa tu contraseña"),
+});
+
+type LoginValues = z.infer<typeof loginSchema>;
+
+export function LoginForm({ next = "/" }: { next?: string }) {
+  const router = useRouter();
+  const [showPassword, setShowPassword] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
+
+  const safeNext =
+    next.startsWith("/") && !next.startsWith("//") && next !== "/login" ? next : "/";
+
+  const form = useForm<LoginValues>({
+    resolver: zodResolver(loginSchema),
+    defaultValues: { email: "", password: "" },
+  });
+
+  function onSubmit(values: LoginValues) {
+    setSubmitError(null);
+    startTransition(async () => {
+      const res = await loginAction(values);
+      if (res.success) {
+        toast.success("Sesión iniciada", {
+          description: "Bienvenido al portal de Acelera Soluciones.",
+        });
+        router.push(res.redirectTo ?? safeNext);
+        router.refresh();
+      } else {
+        setSubmitError(res.error);
+        toast.error("No se pudo iniciar sesión", { description: res.error });
+      }
+    });
+  }
+
+  return (
+    <div className="flex min-h-screen flex-col bg-background text-foreground lg:flex-row">
+      {/* Panel de marca (solo desktop) */}
+      <aside className="hidden lg:flex w-[44%] max-w-xl flex-col justify-between overflow-hidden relative bg-gradient-to-br from-[#0055AA] via-[#0066CC] to-[#003D7A] p-10 text-white select-none">
+        <div className="absolute -right-24 -top-24 size-96 rounded-full bg-white/10 blur-2xl" />
+        <div className="absolute -bottom-32 -left-16 size-96 rounded-full bg-black/20 blur-2xl" />
+
+        <div className="relative flex flex-col gap-2.5">
+          <FortexLogo variant="white" maxWidth={180} priority />
+          <p className="text-[11px] text-white/70 font-medium">
+            Creado por <span className="font-semibold text-white/90">Fortex Digital Solutions</span>
+          </p>
+        </div>
+
+        <div className="absolute left-10 right-10 top-1/2 -translate-y-1/2 space-y-6">
+          <h1 className="text-3xl font-extrabold leading-tight tracking-tight">
+            Gestión técnica de transporte vertical.
+          </h1>
+          <p className="text-sm text-white/80 leading-relaxed max-w-sm">
+            Órdenes de trabajo, contratos, catálogos de equipos y seguridad operativa en un solo
+            lugar.
+          </p>
+          <ul className="space-y-3 pt-1">
+            <li className="flex items-center gap-3 text-sm text-white/90">
+              <span className="flex size-8 items-center justify-center rounded-lg bg-white/10">
+                <Wrench className="size-4" />
+              </span>
+              Órdenes de trabajo y mantenimiento
+            </li>
+            <li className="flex items-center gap-3 text-sm text-white/90">
+              <span className="flex size-8 items-center justify-center rounded-lg bg-white/10">
+                <Building2 className="size-4" />
+              </span>
+              Clientes, contratos y centros de costo
+            </li>
+            <li className="flex items-center gap-3 text-sm text-white/90">
+              <span className="flex size-8 items-center justify-center rounded-lg bg-white/10">
+                <ShieldCheck className="size-4" />
+              </span>
+              Seguridad con cifrado Argon2id
+            </li>
+          </ul>
+        </div>
+
+        <p className="relative text-[11px] text-white/50 font-medium">
+          © {new Date().getFullYear()} Acelera Soluciones · Uso exclusivo del personal autorizado.
+        </p>
+      </aside>
+
+      {/* Panel del formulario */}
+      <main className="flex flex-1 items-center justify-center px-4 py-8 sm:px-6 lg:py-10">
+        <div className="w-full max-w-sm lg:rounded-2xl lg:border lg:border-border/70 lg:bg-card lg:p-8 lg:shadow-[0_8px_30px_rgb(0,0,0,0.04)]">
+          {/* Marca compacta (móvil) */}
+          <div className="mb-5 flex flex-col items-center gap-2 lg:hidden">
+            <FortexLogo maxWidth={150} priority />
+            <p className="text-center text-[11px] text-muted-foreground font-medium">
+              Creado por{" "}
+              <span className="font-semibold text-foreground">Fortex Digital Solutions</span>
+            </p>
+          </div>
+
+          <div className="mb-8">
+            <p className="mb-2 inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/60 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Portal de Acelera Soluciones
+            </p>
+            <h2 className="text-2xl font-extrabold tracking-tight">Iniciar sesión</h2>
+            <p className="mt-1.5 text-sm text-muted-foreground">
+              Accede con tu correo y contraseña corporativos.
+            </p>
+          </div>
+
+          {submitError && (
+            <div className="mb-4 flex items-start gap-2.5 rounded-lg border border-red-500/30 bg-red-500/10 px-3.5 py-3 text-xs text-red-600 dark:text-red-400">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+              <span>{submitError}</span>
+            </div>
+          )}
+
+          <Form {...form}>
+            <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4" noValidate>
+              <FormField
+                control={form.control}
+                name="email"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel className="text-xs font-semibold">Correo electrónico</FormLabel>
+                    <FormControl>
+                      <EmailInput
+                        leadingIcon={<Mail className="size-4" />}
+                        placeholder="tu.nombre"
+                         className="h-12 focus-visible:ring-[#0066CC]"
+                        value={field.value}
+                        onChange={field.onChange}
+                        onBlur={field.onBlur}
+                        name={field.name}
+                        ref={field.ref}
+                      />
+                    </FormControl>
+                    {field.value && (
+                      <p className="mt-1 text-xs text-muted-foreground sm:hidden">
+                        Se usará: {field.value}
+                      </p>
+                    )}
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="password"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel className="text-xs font-semibold">Contraseña</FormLabel>
+                    <FormControl>
+                      <div className="relative">
+                        <Lock className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                         <Input
+                          type={showPassword ? "text" : "password"}
+                          autoComplete="current-password"
+                          placeholder="••••••••"
+                           className="h-12 border-border bg-background pl-9 pr-9 font-mono text-sm focus-visible:ring-1 focus-visible:ring-[#0066CC]"
+                          {...field}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowPassword(!showPassword)}
+                           className="absolute right-2 top-1/2 flex size-9 -translate-y-1/2 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                          title={showPassword ? "Ocultar contraseña" : "Mostrar contraseña"}
+                        >
+                          {showPassword ? (
+                            <EyeOff className="size-4" />
+                          ) : (
+                            <Eye className="size-4" />
+                          )}
+                        </button>
+                      </div>
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+
+              <Button
+                type="submit"
+                size="lg"
+                disabled={isPending}
+                 className="mt-2 h-12 w-full gap-2 bg-[#0066CC] font-semibold text-white shadow-md transition-opacity hover:bg-[#0055AA] disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                {isPending ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <LogIn className="size-4" />
+                )}
+                {isPending ? "Verificando..." : "Ingresar"}
+                {!isPending && <ChevronRight className="size-4" />}
+              </Button>
+            </form>
+          </Form>
+
+           <p className="mt-6 text-center text-[11px] text-muted-foreground">
+             ¿No puedes acceder?{" "}
+             <a className="font-semibold text-blue-600 underline-offset-2 hover:underline" href="mailto:administrador@acelera-soluciones.com">
+               Contacta al administrador
+             </a>
+             .
+          </p>
+        </div>
+      </main>
+    </div>
+  );
+}

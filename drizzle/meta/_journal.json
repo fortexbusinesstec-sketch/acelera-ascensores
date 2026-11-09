@@ -1,0 +1,244 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1788879767192,
+      "tag": "0000_init",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1788904667409,
+      "tag": "0001_preventive_routes",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1788991200000,
+      "tag": "0002_contract_document_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1788993849004,
+      "tag": "0003_work_orders_scheduled_datetime",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1788995000000,
+      "tag": "0004_work_order_elevators_evidence",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1789014325596,
+      "tag": "0005_work_order_elevators_final_status",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1789110000000,
+      "tag": "0006_cost_center_password_hash",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1789150000000,
+      "tag": "0007_clients_tax_id_nullable",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1790191218696,
+      "tag": "0008_chubby_human_cannonball",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1790268919084,
+      "tag": "0009_drop_invoice_items_line_type",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1790287731391,
+      "tag": "0010_add_ubigeos",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1790307190941,
+      "tag": "0011_add_quotations",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1790355695120,
+      "tag": "0012_invoice_payer",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "6",
+      "when": 1790382831899,
+      "tag": "0013_flawless_tarot",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "6",
+      "when": 1790391765441,
+      "tag": "0014_odd_marvel_boy",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "6",
+      "when": 1790398452238,
+      "tag": "0015_secret_santa_claus",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "6",
+      "when": 1790400000000,
+      "tag": "0016_preventive_route_stops_generated_ot_fk",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "6",
+      "when": 1790401283197,
+      "tag": "0017_wise_talkback",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "6",
+      "when": 1790500000000,
+      "tag": "0018_quotation_pdf_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "6",
+      "when": 1790501000000,
+      "tag": "0019_quotation_tax_breakdown",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "6",
+      "when": 1790502000000,
+      "tag": "0020_quotation_document_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "6",
+      "when": 1790503000000,
+      "tag": "0021_staff_provider_type",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "6",
+      "when": 1790504000000,
+      "tag": "0022_roles_is_field_role",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "6",
+      "when": 1790505000000,
+      "tag": "0023_maintenance_inventory",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1790506000000,
+      "tag": "0024_maintenance_execution_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "6",
+      "when": 1790507000000,
+      "tag": "0025_contract_elevator_module_months",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "6",
+      "when": 1790508000000,
+      "tag": "0026_move_months_to_maintenance_modules",
+      "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "6",
+      "when": 1790509000000,
+      "tag": "0027_maintenance_zones",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "6",
+      "when": 1790510000000,
+      "tag": "0028_maintenance_equipment_types",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "6",
+      "when": 1790511000000,
+      "tag": "0029_modules_code_by_elevator_type",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1790512000000,
+      "tag": "0030_maintenance_rotation_calendar",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1790599200000,
+      "tag": "0031_maintenance_rotation_group_only",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "6",
+      "when": 1790602800000,
+      "tag": "0032_sync_missing_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "6",
+      "when": 1790606400000,
+      "tag": "0033_drop_invoice_items_line_type",
+      "breakpoints": true
+    }
+  ]
+}
