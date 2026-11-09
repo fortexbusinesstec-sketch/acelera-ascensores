@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef } from "react";
 import Link from "next/link";
 import { AlertTriangle, Play } from "lucide-react";
 import { cn } from "cn";
@@ -17,29 +17,43 @@ function formatRemaining(remainingMs: number): string {
   return `${pad(h)}:${pad(m)}:${pad(s)}`;
 }
 
+/**
+ * SLA en vivo. Pinta el texto directo en el DOM: un `setNow` por segundo
+ * commiteaba un render cada segundo (y el overlay de Next parpadeaba
+ * "Rendering") sin necesidad de tocar el árbol de React.
+ */
 function Countdown({ deadline }: { deadline: number }) {
-  const [now, setNow] = useState<number>(0);
+  const labelRef = useRef<HTMLSpanElement | null>(null);
 
   useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(timer);
-  }, []);
+    const node = labelRef.current;
+    if (!node) return;
 
-  const remainingMs = deadline * 1000 - now;
-  const expired = remainingMs <= 0;
+    let timer = 0;
+    const paint = () => {
+      const remainingMs = deadline * 1000 - Date.now();
+      if (remainingMs <= 0) {
+        node.textContent = "SLA VENCIDO";
+        window.clearInterval(timer);
+        return;
+      }
+      node.textContent = `SLA ${formatRemaining(remainingMs)}`;
+    };
+
+    paint();
+    timer = window.setInterval(paint, 1000);
+    return () => window.clearInterval(timer);
+  }, [deadline]);
 
   return (
     <span
+      ref={labelRef}
       className={cn(
         "mt-0.5 inline-flex items-center rounded-md px-1.5 py-0.5 font-mono text-xs font-black tabular-nums",
         "bg-white/20 text-white"
       )}
     >
-      {now === 0
-        ? "SLA --:--"
-        : expired
-          ? "SLA VENCIDO"
-          : `SLA ${formatRemaining(remainingMs)}`}
+      SLA --:--
     </span>
   );
 }
